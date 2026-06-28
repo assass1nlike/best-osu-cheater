@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OsuLazerPath Condition="'$(OsuLazerPath)' == '' and '$(OSU_LAZER_PATH)' != ''">$(OSU_LAZER_PATH)</OsuLazerPath>
+    <OsuLazerPath Condition="'$(OsuLazerPath)' == '' and '$(LOCALAPPDATA)' != ''">$(LOCALAPPDATA)\osulazer\current</OsuLazerPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="osu.Game">
+      <HintPath>$(OsuLazerPath)\osu.Game.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="osu.Game.Rulesets.Osu">
+      <HintPath>$(OsuLazerPath)\osu.Game.Rulesets.Osu.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="osu.Framework">
+      <HintPath>$(OsuLazerPath)\osu.Framework.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="NUnit.Framework">
+      <HintPath>$(OsuLazerPath)\nunit.framework.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="osuTK">
+      <HintPath>$(OsuLazerPath)\osuTK.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Realm">
+      <HintPath>$(OsuLazerPath)\Realm.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

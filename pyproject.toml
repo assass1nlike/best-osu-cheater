@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synthesis-osu-play"
+version = "0.1.0"
+description = "Offline osu! replay synthesis tools"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "synthesis-osu-play contributors" }]
+
+[project.scripts]
+synthesis-osu-play = "synthesis_osu_play.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
