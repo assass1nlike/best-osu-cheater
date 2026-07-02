@@ -13,3 +13,6 @@ build/
 artifacts/
 tools/**/bin/
 tools/**/obj/
+tools/tosu/tosu.exe
+tools/tosu/logs/
+tools/tosu/static/

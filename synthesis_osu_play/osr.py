@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .mods import legacy_mods_to_lazer_metadata
+
 
 DOTNET_TICKS_AT_UNIX_EPOCH = 621_355_968_000_000_000
 TICKS_PER_SECOND = 10_000_000
@@ -110,18 +112,26 @@ class OsrReplay:
         frames: tuple[ReplayFrame, ...],
         *,
         player_name: str | None = None,
+        mods: int | None = None,
         timestamp: int | None = None,
         online_score_id: int | None = None,
     ) -> "OsrReplay":
         replay_text = format_replay_data(frames)
         digest = hashlib.md5(replay_text.encode("utf-8")).hexdigest()
         trailing_bytes = scrub_lazer_replay_metadata(self.trailing_bytes)
+        output_mods = self.mods if mods is None else mods
+        if output_mods != self.mods:
+            metadata = decode_lazer_replay_metadata(trailing_bytes)
+            if metadata is not None:
+                metadata["mods"] = legacy_mods_to_lazer_metadata(output_mods)
+                trailing_bytes = encode_lazer_replay_metadata(metadata)
         if online_score_id is None:
             online_score_id = MISSING_ONLINE_ID if trailing_bytes else 0
         return replace(
             self,
             player_name=player_name if player_name is not None else self.player_name,
             replay_md5=digest,
+            mods=output_mods,
             timestamp=timestamp if timestamp is not None else current_dotnet_ticks(),
             frames=frames,
             online_score_id=online_score_id,

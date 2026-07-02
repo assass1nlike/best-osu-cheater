@@ -4,7 +4,15 @@ import pytest
 
 from synthesis_osu_play.beatmap import Beatmap, HitObject
 from synthesis_osu_play.finalize import finalize_replay_metadata
+from synthesis_osu_play.mods import (
+    MOD_DOUBLE_TIME,
+    MOD_EASY,
+    MOD_HALF_TIME,
+    MOD_HARD_ROCK,
+    MOD_HIDDEN,
+)
 from synthesis_osu_play.osr import OsrReplay, ReplayFrame, decode_lazer_replay_metadata, encode_lazer_replay_metadata
+import synthesis_osu_play.synthesis as synthesis_module
 from synthesis_osu_play.synthesis import (
     KeyInterval,
     LEGACY_X_KEY,
@@ -12,6 +20,7 @@ from synthesis_osu_play.synthesis import (
     SynthesisError,
     ensure_no_triple_overlap,
     extract_key_intervals,
+    modded_hit_objects_for_matching,
     synthesize_replays,
     to_absolute_frames,
 )
@@ -85,11 +94,257 @@ def test_synthesize_averages_positions_and_key_intervals() -> None:
     assert result.replay.frames[2].y == 5.0
 
 
-def test_synthesize_rejects_different_mods() -> None:
+def test_synthesize_rejects_unsupported_mod_mismatch() -> None:
     first = make_replay((ReplayFrame(0, 0.0, 0.0, 0),), mods=0)
-    second = make_replay((ReplayFrame(0, 0.0, 0.0, 0),), mods=64)
+    second = make_replay((ReplayFrame(0, 0.0, 0.0, 0),), mods=MOD_EASY)
 
     with pytest.raises(SynthesisError):
+        synthesize_replays(first, second)
+
+
+def test_synthesize_allows_hidden_mismatch_and_clears_output_hidden() -> None:
+    first = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        ),
+        mods=MOD_HIDDEN,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second)
+
+    assert result.replay.mods == 0
+    assert extract_key_intervals(to_absolute_frames(result.replay.frames), LEGACY_Z_KEY) == [KeyInterval(100, 150)]
+
+
+def test_synthesize_preserves_hidden_when_both_replays_have_hidden() -> None:
+    replay = make_replay((ReplayFrame(0, 0.0, 0.0, 0),), mods=MOD_HIDDEN)
+
+    result = synthesize_replays(replay, replay)
+
+    assert result.replay.mods == MOD_HIDDEN
+
+
+def test_synthesize_allows_double_time_mismatch_without_rescaling_legacy_frame_times() -> None:
+    first = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        ),
+        mods=MOD_DOUBLE_TIME,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second)
+
+    assert result.replay.mods == 0
+    assert extract_key_intervals(to_absolute_frames(result.replay.frames), LEGACY_Z_KEY) == [KeyInterval(100, 150)]
+
+
+def test_synthesize_allows_half_time_mismatch_without_rescaling_legacy_frame_times() -> None:
+    first = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        ),
+        mods=MOD_HALF_TIME,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 100.0, 100.0, 0),
+            ReplayFrame(100, 100.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 100.0, 100.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second)
+
+    assert result.replay.mods == 0
+    assert extract_key_intervals(to_absolute_frames(result.replay.frames), LEGACY_Z_KEY) == [KeyInterval(100, 150)]
+
+
+def test_synthesize_flips_hard_rock_replay_to_normal_playfield() -> None:
+    first = make_replay((ReplayFrame(0, 100.0, 100.0, 0),), mods=MOD_HARD_ROCK)
+    second = make_replay((ReplayFrame(0, 100.0, 284.0, 0),))
+
+    result = synthesize_replays(first, second)
+
+    assert result.replay.mods == 0
+    assert result.replay.frames[0].y == pytest.approx(284.0)
+
+
+def test_hard_rock_object_flip_also_flips_slider_control_points() -> None:
+    obj = HitObject(
+        0,
+        100.0,
+        80.0,
+        1000,
+        2,
+        end_time_ms=1200,
+        slider_curve_type="L",
+        slider_control_points=((100.0, 80.0), (200.0, 120.0)),
+    )
+
+    flipped = modded_hit_objects_for_matching((obj,), MOD_HARD_ROCK)[0]
+
+    assert flipped.y == pytest.approx(304.0)
+    assert flipped.slider_control_points == ((100.0, 304.0), (200.0, 264.0))
+
+
+def test_object_aware_synthesis_matches_cross_hard_rock_after_flip() -> None:
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(HitObject(0, 256.0, 100.0, 1000, 1),),
+    )
+    first = make_replay(
+        (
+            ReplayFrame(0, 256.0, 284.0, 0),
+            ReplayFrame(1000, 256.0, 284.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 284.0, 0),
+        ),
+        mods=MOD_HARD_ROCK,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 256.0, 100.0, 0),
+            ReplayFrame(1000, 256.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 100.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second, beatmap=beatmap)
+
+    assert result.replay.mods == 0
+    assert result.report.matched_object_count == 1
+    assert result.report.dropped_object_count == 0
+    assert result.replay.frames[1].y == pytest.approx(100.0)
+
+
+def test_object_aware_synthesis_matches_shared_hard_rock_in_hard_rock_space() -> None:
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(HitObject(0, 256.0, 100.0, 1000, 1),),
+    )
+    first = make_replay(
+        (
+            ReplayFrame(0, 256.0, 284.0, 0),
+            ReplayFrame(1000, 256.0, 284.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 284.0, 0),
+        ),
+        mods=MOD_HARD_ROCK,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 256.0, 284.0, 0),
+            ReplayFrame(1000, 256.0, 284.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 284.0, 0),
+        ),
+        mods=MOD_HARD_ROCK,
+    )
+
+    result = synthesize_replays(first, second, beatmap=beatmap)
+
+    assert result.replay.mods == MOD_HARD_ROCK
+    assert result.report.matched_object_count == 1
+    assert result.report.dropped_object_count == 0
+    assert result.replay.frames[1].y == pytest.approx(284.0)
+
+
+def test_local_score_uses_hard_rock_object_positions() -> None:
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(HitObject(0, 256.0, 100.0, 1000, 1),),
+    )
+    replay = make_replay(
+        (
+            ReplayFrame(0, 256.0, 284.0, 0),
+            ReplayFrame(1000, 256.0, 284.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 284.0, 0),
+        ),
+        mods=MOD_HARD_ROCK,
+    )
+
+    metadata = score_replay(replay, beatmap)
+
+    assert metadata.count_300 == 1
+    assert metadata.count_miss == 0
+
+
+def test_synthesize_combined_handled_mods_and_rewrites_lazer_metadata() -> None:
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(HitObject(0, 256.0, 100.0, 1000, 1),),
+    )
+    trailing_bytes = encode_lazer_replay_metadata(
+        {
+            "client_version": "",
+            "rank": "XH",
+            "user_id": 123,
+            "online_id": 456,
+            "mods": [{"acronym": "HD"}, {"acronym": "HR"}, {"acronym": "DT"}],
+            "statistics": {"great": 1},
+            "maximum_statistics": {"great": 1},
+        }
+    )
+    first = make_replay(
+        (
+            ReplayFrame(0, 256.0, 284.0, 0),
+            ReplayFrame(1000, 256.0, 284.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 284.0, 0),
+        ),
+        mods=MOD_HIDDEN | MOD_HARD_ROCK | MOD_DOUBLE_TIME,
+        trailing_bytes=trailing_bytes,
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 256.0, 100.0, 0),
+            ReplayFrame(1000, 256.0, 100.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 100.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second, beatmap=beatmap)
+    metadata = decode_lazer_replay_metadata(result.replay.trailing_bytes)
+
+    assert result.replay.mods == 0
+    assert result.report.matched_object_count == 1
+    assert metadata is not None
+    assert metadata["mods"] == []
+
+
+def test_synthesize_rejects_conflicting_speed_mods() -> None:
+    first = make_replay((ReplayFrame(0, 0.0, 0.0, 0),), mods=MOD_DOUBLE_TIME | MOD_HALF_TIME)
+    second = make_replay((ReplayFrame(0, 0.0, 0.0, 0),))
+
+    with pytest.raises(SynthesisError, match="conflicting speed mods"):
         synthesize_replays(first, second)
 
 
@@ -151,6 +406,56 @@ def test_object_aware_synthesis_fills_miss_chain_from_nearby_extra_clicks() -> N
         KeyInterval(2975, 3025),
     ]
     assert extract_key_intervals(absolute, LEGACY_X_KEY) == [KeyInterval(1985, 2035)]
+
+
+def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DeterministicRandom:
+        def __init__(self, seed: int) -> None:
+            self.seed = seed
+
+        def gauss(self, mu: float, sigma: float) -> float:
+            return sigma / 2
+
+    monkeypatch.setattr(synthesis_module, "Random", DeterministicRandom)
+
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(
+            HitObject(0, 256.0, 192.0, 1000, 1),
+            HitObject(1, 256.0, 192.0, 1500, 8, end_time_ms=2000),
+            HitObject(2, 256.0, 192.0, 2200, 1),
+        ),
+    )
+    first = make_replay(
+        (
+            ReplayFrame(0, 256.0, 192.0, 0),
+            ReplayFrame(1000, 256.0, 192.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 192.0, 0),
+            ReplayFrame(1150, 256.0, 192.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 192.0, 0),
+        )
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 256.0, 192.0, 0),
+            ReplayFrame(1010, 256.0, 192.0, LEGACY_Z_KEY),
+            ReplayFrame(60, 256.0, 192.0, 0),
+            ReplayFrame(1130, 256.0, 192.0, LEGACY_Z_KEY),
+            ReplayFrame(50, 256.0, 192.0, 0),
+        )
+    )
+
+    result = synthesize_replays(first, second, beatmap=beatmap)
+    absolute = to_absolute_frames(result.replay.frames)
+
+    assert extract_key_intervals(absolute, LEGACY_Z_KEY) == [
+        KeyInterval(1005, 1060),
+        KeyInterval(2200, 2250),
+    ]
+    assert extract_key_intervals(absolute, LEGACY_X_KEY) == [KeyInterval(1446, 2075)]
 
 
 def test_object_aware_synthesis_drops_object_missing_in_either_replay() -> None:
@@ -497,15 +802,15 @@ def test_real_spinner_replay_is_scored_from_actual_input_state() -> None:
     beatmap = Beatmap.read_path(ARTIFACT_1643386 / "1643386.osu")
     source_12 = OsrReplay.read_path(ARTIFACT_1643386 / "rank12_3410678288.osr")
     source_14 = OsrReplay.read_path(ARTIFACT_1643386 / "rank14_5054510460.osr")
-    synthesized = OsrReplay.read_path(ARTIFACT_1643386 / "synth_rank12_rank14.osr")
 
     meta_12 = score_replay(source_12, beatmap)
     meta_14 = score_replay(source_14, beatmap)
+    synthesized = synthesize_replays(source_12, source_14, beatmap=beatmap).replay
     meta_synth = score_replay(synthesized, beatmap)
 
     assert meta_12.count_miss == 0
     assert meta_14.count_miss == 0
     assert meta_12.statistics["large_bonus"] == 5
     assert meta_14.statistics["large_bonus"] == 5
-    assert meta_synth.count_miss == 1
-    assert meta_synth.statistics.get("large_bonus", 0) == 0
+    assert meta_synth.count_miss == 0
+    assert meta_synth.statistics["large_bonus"] == 5

@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from math import dist
+import hashlib
+from dataclasses import dataclass, replace
+from math import dist, isfinite, nextafter
+from random import Random
 
 from .beatmap import Beatmap, HitObject
+from .mods import (
+    MOD_EASY,
+    MOD_HARD_ROCK,
+    MOD_HIDDEN,
+    SPEED_NORMAL,
+    SYNTHESIS_VARIABLE_MOD_MASK,
+    canonical_speed_mod_bits,
+    speed_mod_category,
+)
 from .osr import OsrReplay, ReplayFrame
 
 
 OSU_STANDARD_MODE = 0
+OSU_STANDARD_PLAYFIELD_HEIGHT = 384.0
 SENTINEL_DELTA = -12345
 DEFAULT_KEY_MASK = 0x1F
 LAZER_MINIMUM_SKIP_TIME_MS = 1000
@@ -65,6 +77,7 @@ class SynthesisReport:
     dropped_object_count: int = 0
     skip_press_ms: int | None = None
     intro_end_ms: int | None = None
+    spinner_replacements: list | None = None
 
 
 @dataclass(frozen=True)
@@ -73,24 +86,43 @@ class SynthesizedReplay:
     report: SynthesisReport
 
 
+@dataclass(frozen=True)
+class ReplayCompatibility:
+    output_mods: int
+
+
 def synthesize_replays(
     first: OsrReplay,
     second: OsrReplay,
     *,
     beatmap: Beatmap | None = None,
     player_name: str | None = None,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
     allow_key_mismatch: bool = False,
     key_mask: int = DEFAULT_KEY_MASK,
     first_skip_ms: int | None = None,
     second_skip_ms: int | None = None,
     intro_end_ms: int | None = None,
     recompute_score_metadata: bool = False,
+    output_mods: int | None = None,
+    spinner_library_path: str | None = None,
+    sequential_match: bool = True,
 ) -> SynthesizedReplay:
-    validate_compatible(first, second)
+    validate_weights(first_weight, second_weight)
+    compatibility = validate_compatible(first, second, output_mods=output_mods)
     first_frames, first_seed = split_sentinel(first.frames)
     second_frames, second_seed = split_sentinel(second.frames)
-    first_absolute = to_absolute_frames(first_frames)
-    second_absolute = to_absolute_frames(second_frames)
+    first_absolute = normalize_absolute_frames(
+        to_absolute_frames(first_frames),
+        source_mods=first.mods,
+        output_mods=compatibility.output_mods,
+    )
+    second_absolute = normalize_absolute_frames(
+        to_absolute_frames(second_frames),
+        source_mods=second.mods,
+        output_mods=compatibility.output_mods,
+    )
     if not first_absolute or not second_absolute:
         raise SynthesisError("both replays need at least one non-sentinel frame")
 
@@ -98,16 +130,28 @@ def synthesize_replays(
         key_intervals = average_key_intervals(
             first_absolute,
             second_absolute,
+            first_weight=first_weight,
+            second_weight=second_weight,
             allow_mismatch=allow_key_mismatch,
             key_mask=key_mask,
         )
         matched_object_count = 0
         dropped_object_count = 0
     else:
+        spinner_seed = spinner_noise_seed(
+            first,
+            second,
+            beatmap,
+        )
         key_intervals, matched_object_count, dropped_object_count = synthesize_key_intervals_for_beatmap(
             first_absolute,
             second_absolute,
             beatmap,
+            output_mods=compatibility.output_mods,
+            first_weight=first_weight,
+            second_weight=second_weight,
+            spinner_seed=spinner_seed,
+            sequential_match=sequential_match,
         )
 
     skip_press_ms = earliest_time(first_skip_ms, second_skip_ms)
@@ -130,17 +174,41 @@ def synthesize_replays(
             second_absolute,
             key_intervals,
             time_ms,
+            first_weight=first_weight,
+            second_weight=second_weight,
             skip_press_ms=skip_press_ms,
             intro_end_ms=intro_end_ms,
         )
         for time_ms in output_times
     ]
+    # --- spinner trajectory replacement ---
+    spinner_replacements: list = []
+    if spinner_library_path is not None and beatmap is not None:
+        spinner_intervals = [
+            (obj.time_ms, obj.resolved_end_time_ms)
+            for obj in beatmap.hit_objects
+            if obj.is_spinner
+        ]
+        if spinner_intervals:
+            from .spinner_replace import replace_spinner_segments
+            output_absolute, spinner_replacements = replace_spinner_segments(
+                output_absolute,
+                list(beatmap.hit_objects),
+                spinner_intervals,
+                library_path=spinner_library_path,
+            )
+
     output_frames = to_delta_frames(output_absolute)
-    seed = average_seed(first_seed, second_seed)
+    seed = average_seed(
+        first_seed,
+        second_seed,
+        first_weight=first_weight,
+        second_weight=second_weight,
+    )
     if seed is not None:
         output_frames.append(ReplayFrame(SENTINEL_DELTA, 0.0, 0.0, seed))
 
-    replay = first.with_frames(tuple(output_frames), player_name=player_name)
+    replay = first.with_frames(tuple(output_frames), player_name=player_name, mods=compatibility.output_mods)
     if beatmap is not None and recompute_score_metadata:
         from .scoring import replay_with_recomputed_score_metadata
 
@@ -153,6 +221,7 @@ def synthesize_replays(
         dropped_object_count=dropped_object_count,
         skip_press_ms=skip_press_ms,
         intro_end_ms=intro_end_ms,
+        spinner_replacements=spinner_replacements if spinner_replacements else None,
     )
     return SynthesizedReplay(replay=replay, report=report)
 
@@ -163,6 +232,8 @@ def average_frame_at_time(
     key_intervals: dict[int, list[KeyInterval]],
     time_ms: int,
     *,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
     skip_press_ms: int | None = None,
     intro_end_ms: int | None = None,
 ) -> AbsoluteFrame:
@@ -170,6 +241,8 @@ def average_frame_at_time(
         first,
         second,
         time_ms,
+        first_weight=first_weight,
+        second_weight=second_weight,
         skip_press_ms=skip_press_ms,
         intro_end_ms=intro_end_ms,
     )
@@ -186,26 +259,102 @@ def average_position_at_time(
     second: list[AbsoluteFrame],
     time_ms: int,
     *,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
     skip_press_ms: int | None = None,
     intro_end_ms: int | None = None,
 ) -> tuple[float, float]:
     first_x, first_y = interpolate_position(first, time_ms)
     second_x, second_y = interpolate_position(second, time_ms)
-    if skip_press_ms is not None and intro_end_ms is not None and time_ms <= skip_press_ms:
-        anchor_x, anchor_y = average_position_at_time(first, second, intro_end_ms)
-        return (first_x + second_x + anchor_x) / 3.0, (first_y + second_y + anchor_y) / 3.0
-    return (first_x + second_x) / 2.0, (first_y + second_y) / 2.0
+    if skip_press_ms is not None and intro_end_ms is not None and intro_end_ms > skip_press_ms and time_ms <= skip_press_ms:
+        anchor_x, anchor_y = average_position_at_time(
+            first,
+            second,
+            intro_end_ms,
+            first_weight=first_weight,
+            second_weight=second_weight,
+        )
+        return (
+            weighted_average_three(first_x, second_x, anchor_x, first_weight, second_weight, 1.0),
+            weighted_average_three(first_y, second_y, anchor_y, first_weight, second_weight, 1.0),
+        )
+    return (
+        weighted_average_pair(first_x, second_x, first_weight, second_weight),
+        weighted_average_pair(first_y, second_y, first_weight, second_weight),
+    )
 
 
-def validate_compatible(first: OsrReplay, second: OsrReplay) -> None:
+def validate_compatible(first: OsrReplay, second: OsrReplay, *, output_mods: int | None = None) -> ReplayCompatibility:
     if first.mode != second.mode:
         raise SynthesisError(f"replay modes differ: {first.mode} != {second.mode}")
     if first.mode != OSU_STANDARD_MODE:
         raise SynthesisError("only osu!standard replays are supported")
     if first.beatmap_md5 != second.beatmap_md5:
         raise SynthesisError("beatmap MD5 hashes differ")
-    if first.mods != second.mods:
-        raise SynthesisError(f"mods differ: {first.mods} != {second.mods}")
+    if output_mods is None:
+        return ReplayCompatibility(output_mods=synthesis_output_mods(first.mods, second.mods))
+    validate_replay_mods_against_output(first.mods, output_mods, "first")
+    validate_replay_mods_against_output(second.mods, output_mods, "second")
+    return ReplayCompatibility(output_mods=output_mods)
+
+
+def synthesis_output_mods(first_mods: int, second_mods: int) -> int:
+    first_speed = replay_speed_category(first_mods, "first")
+    second_speed = replay_speed_category(second_mods, "second")
+    first_base = first_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
+    second_base = second_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
+    if first_base != second_base:
+        raise SynthesisError(
+            "mods differ after HD/HR/DT/NC/HT normalization: "
+            f"{first_mods} != {second_mods}"
+        )
+
+    output_mods = first_base
+    if first_mods & MOD_HIDDEN and second_mods & MOD_HIDDEN:
+        output_mods |= MOD_HIDDEN
+    if first_mods & MOD_HARD_ROCK and second_mods & MOD_HARD_ROCK:
+        output_mods |= MOD_HARD_ROCK
+    if first_speed == second_speed and first_speed != SPEED_NORMAL:
+        output_mods |= canonical_speed_mod_bits(first_speed, first_mods, second_mods)
+    return output_mods
+
+
+def replay_speed_category(mods: int, label: str) -> str:
+    try:
+        return speed_mod_category(mods)
+    except ValueError as exc:
+        raise SynthesisError(f"{label} replay has conflicting speed mods: {mods}") from exc
+
+
+def validate_replay_mods_against_output(source_mods: int, output_mods: int, label: str) -> None:
+    replay_speed_category(source_mods, label)
+    replay_speed_category(output_mods, "output")
+    source_base = source_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
+    output_base = output_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
+    if source_base != output_base:
+        raise SynthesisError(
+            f"{label} replay mods cannot be normalized to output mods: "
+            f"{source_mods} -> {output_mods}"
+        )
+
+
+def normalize_absolute_frames(
+    frames: list[AbsoluteFrame],
+    *,
+    source_mods: int,
+    output_mods: int,
+) -> list[AbsoluteFrame]:
+    if bool(source_mods & MOD_HARD_ROCK) == bool(output_mods & MOD_HARD_ROCK):
+        return frames
+    return [
+        AbsoluteFrame(
+            time_ms=frame.time_ms,
+            x=frame.x,
+            y=OSU_STANDARD_PLAYFIELD_HEIGHT - frame.y,
+            keys=frame.keys,
+        )
+        for frame in frames
+    ]
 
 
 def split_sentinel(frames: tuple[ReplayFrame, ...]) -> tuple[tuple[ReplayFrame, ...], int | None]:
@@ -265,6 +414,8 @@ def average_key_intervals(
     first: list[AbsoluteFrame],
     second: list[AbsoluteFrame],
     *,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
     allow_mismatch: bool,
     key_mask: int,
 ) -> dict[int, list[KeyInterval]]:
@@ -282,12 +433,37 @@ def average_key_intervals(
         for index in range(paired_count):
             first_interval = first_intervals[index]
             second_interval = second_intervals[index]
-            start = round((first_interval.start_ms + second_interval.start_ms) / 2)
-            end = round((first_interval.end_ms + second_interval.end_ms) / 2)
+            start = round(weighted_average_pair(first_interval.start_ms, second_interval.start_ms, first_weight, second_weight))
+            end = round(weighted_average_pair(first_interval.end_ms, second_interval.end_ms, first_weight, second_weight))
             if end > start:
                 intervals.append(KeyInterval(start, end))
         output[bit] = intervals
     return output
+
+
+def weighted_average_pair(first: float, second: float, first_weight: float, second_weight: float) -> float:
+    total_weight = first_weight + second_weight
+    if total_weight == 0:
+        return (first + second) / 2.0
+    return (first * first_weight + second * second_weight) / total_weight
+
+
+def weighted_average_three(
+    first: float,
+    second: float,
+    third: float,
+    first_weight: float,
+    second_weight: float,
+    third_weight: float,
+) -> float:
+    total_weight = first_weight + second_weight + third_weight
+    if total_weight == 0:
+        return (first + second + third) / 3.0
+    return (
+        first * first_weight
+        + second * second_weight
+        + third * third_weight
+    ) / total_weight
 
 
 def extract_key_intervals(frames: list[AbsoluteFrame], bit: int) -> list[KeyInterval]:
@@ -323,38 +499,73 @@ def synthesize_key_intervals_for_beatmap(
     first: list[AbsoluteFrame],
     second: list[AbsoluteFrame],
     beatmap: Beatmap,
+    *,
+    output_mods: int = 0,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
+    spinner_seed: int | None = None,
+    sequential_match: bool = True,
 ) -> tuple[dict[int, list[KeyInterval]], int, int]:
-    objects = list(beatmap.clickable_hit_objects)
+    objects = modded_hit_objects_for_matching(beatmap.hit_objects, output_mods)
     if not objects:
         return {LEGACY_Z_KEY: [], LEGACY_X_KEY: []}, 0, 0
 
+    clickable_objects = [obj for obj in objects if obj.is_clickable]
     first_clicks = match_effective_clicks(
         first,
-        objects,
-        hit_window_ms=beatmap.hit_window_50_ms,
-        circle_radius=beatmap.circle_radius,
+        clickable_objects,
+        hit_window_ms=modded_hit_window_50_ms(beatmap, output_mods),
+        circle_radius=modded_circle_radius(beatmap, output_mods),
+        sequential=sequential_match,
     )
     second_clicks = match_effective_clicks(
         second,
-        objects,
-        hit_window_ms=beatmap.hit_window_50_ms,
-        circle_radius=beatmap.circle_radius,
+        clickable_objects,
+        hit_window_ms=modded_hit_window_50_ms(beatmap, output_mods),
+        circle_radius=modded_circle_radius(beatmap, output_mods),
+        sequential=sequential_match,
     )
+
+    first_object_clicks = align_object_clicks(objects, first_clicks)
+    second_object_clicks = align_object_clicks(objects, second_clicks)
+    first_previous_clicks = previous_effective_clicks(first_object_clicks)
+    first_next_clicks = next_effective_clicks(first_object_clicks)
+    second_previous_clicks = previous_effective_clicks(second_object_clicks)
+    second_next_clicks = next_effective_clicks(second_object_clicks)
 
     averaged_intervals: list[KeyInterval] = []
     dropped_object_count = 0
-    for first_click, second_click in zip(first_clicks, second_clicks, strict=True):
-        if first_click is None or second_click is None:
-            dropped_object_count += 1
-            continue
-        start = round((first_click.start_ms + second_click.start_ms) / 2)
-        end = round((first_click.end_ms + second_click.end_ms) / 2)
-        if end <= start:
-            end = start + 1
-        averaged_intervals.append(KeyInterval(start, end))
+    matched_object_count = 0
+    clickable_index = 0
+    spinner_rng = Random(spinner_seed if spinner_seed is not None else 0)
+    for object_index, obj in enumerate(objects):
+        if obj.is_clickable:
+            first_click = first_clicks[clickable_index]
+            second_click = second_clicks[clickable_index]
+            clickable_index += 1
+            if first_click is None or second_click is None:
+                dropped_object_count += 1
+                continue
+            start = round(weighted_average_pair(first_click.start_ms, second_click.start_ms, first_weight, second_weight))
+            end = round(weighted_average_pair(first_click.end_ms, second_click.end_ms, first_weight, second_weight))
+            if end <= start:
+                end = start + 1
+            averaged_intervals.append(KeyInterval(start, end))
+            matched_object_count += 1
+        elif obj.is_spinner:
+            interval = synthesize_spinner_interval(
+                obj,
+                first_previous_clicks[object_index],
+                first_next_clicks[object_index],
+                second_previous_clicks[object_index],
+                second_next_clicks[object_index],
+                spinner_rng,
+            )
+            averaged_intervals.append(interval)
+            matched_object_count += 1
 
     ensure_no_triple_overlap(averaged_intervals)
-    return assign_alternating_keys(averaged_intervals), len(averaged_intervals), dropped_object_count
+    return assign_alternating_keys(averaged_intervals), matched_object_count, dropped_object_count
 
 
 def match_effective_clicks(
@@ -363,16 +574,67 @@ def match_effective_clicks(
     *,
     hit_window_ms: int,
     circle_radius: float,
+    sequential: bool = True,
 ) -> list[ClickInterval | None]:
     clicks = extract_click_intervals(frames)
-    valid_clicks = match_valid_object_clicks(
-        frames,
-        objects,
-        clicks,
-        hit_window_ms=hit_window_ms,
-        circle_radius=circle_radius,
-    )
-    return fill_missed_object_clicks(objects, clicks, valid_clicks)
+    if sequential:
+        matched = match_sequential_clicks(
+            frames, objects, clicks,
+            hit_window_ms=hit_window_ms, circle_radius=circle_radius,
+        )
+    else:
+        matched = match_valid_object_clicks(
+            frames, objects, clicks,
+            hit_window_ms=hit_window_ms, circle_radius=circle_radius,
+        )
+    return fill_missed_object_clicks(objects, clicks, matched)
+
+
+def match_sequential_clicks(
+    frames: list[AbsoluteFrame],
+    objects: list[HitObject],
+    clicks: list[ClickInterval],
+    *,
+    hit_window_ms: int,
+    circle_radius: float,
+) -> list[ClickInterval | None]:
+    """Sequential matching: process clicks in order, match to first qualifying object.
+
+    For each click in temporal order:
+    - If it falls within the OD50 window of the current object AND cursor is in CS
+      radius → match, advance both click and object pointers.
+    - If it's before the object's window → skip this click (wasted press).
+    - If it's after the object's window → skip the object (miss), re-check same click.
+    """
+    n_objects = len(objects)
+    n_clicks = len(clicks)
+    output: list[ClickInterval | None] = [None] * n_objects
+    obj_idx = 0
+    click_idx = 0
+
+    while obj_idx < n_objects and click_idx < n_clicks:
+        obj = objects[obj_idx]
+        click = clicks[click_idx]
+        delta = click.start_ms - obj.time_ms
+
+        if abs(delta) <= hit_window_ms:
+            # Check cursor distance
+            if cursor_distance(frames, obj, click.start_ms) <= circle_radius:
+                output[obj_idx] = click
+                obj_idx += 1
+                click_idx += 1
+            else:
+                # In window but cursor too far → skip this click
+                click_idx += 1
+        elif delta < -hit_window_ms:
+            # Click is before the object's window → skip click
+            click_idx += 1
+        else:
+            # delta > hit_window_ms: click is after the object's window → object missed
+            obj_idx += 1
+            # Don't advance click_idx; re-check against next object
+
+    return output
 
 
 def extract_click_intervals(frames: list[AbsoluteFrame]) -> list[ClickInterval]:
@@ -503,11 +765,146 @@ def cursor_distance(frames: list[AbsoluteFrame], obj: HitObject, time_ms: int) -
     return dist((x, y), (obj.x, obj.y))
 
 
+def modded_hit_objects_for_matching(objects: tuple[HitObject, ...], mods: int) -> list[HitObject]:
+    if not mods & MOD_HARD_ROCK:
+        return list(objects)
+    return [
+        replace(
+            obj,
+            y=OSU_STANDARD_PLAYFIELD_HEIGHT - obj.y,
+            slider_control_points=tuple(
+                (x, OSU_STANDARD_PLAYFIELD_HEIGHT - y)
+                for x, y in obj.slider_control_points
+            ),
+        )
+        for obj in objects
+    ]
+
+
+def modded_hit_window_50_ms(beatmap: Beatmap, mods: int) -> int:
+    od = beatmap.overall_difficulty
+    if mods & MOD_HARD_ROCK:
+        od = min(10.0, od * 1.4)
+    if mods & MOD_EASY:
+        od *= 0.5
+    return round(200 - 10 * od)
+
+
+def modded_circle_radius(beatmap: Beatmap, mods: int) -> float:
+    cs = beatmap.circle_size
+    if mods & MOD_HARD_ROCK:
+        cs = min(10.0, cs * 1.3)
+    if mods & MOD_EASY:
+        cs *= 0.5
+    return 54.4 - 4.48 * cs
+
+
 def assign_alternating_keys(intervals: list[KeyInterval]) -> dict[int, list[KeyInterval]]:
     output = {LEGACY_Z_KEY: [], LEGACY_X_KEY: []}
-    for index, interval in enumerate(intervals):
+    for index, interval in enumerate(sorted(intervals, key=lambda interval: (interval.start_ms, interval.end_ms))):
         bit = LEGACY_Z_KEY if index % 2 == 0 else LEGACY_X_KEY
         output[bit].append(interval)
+    return output
+
+
+def synthesize_spinner_interval(
+    obj: HitObject,
+    first_previous_click: ClickInterval | None,
+    first_next_click: ClickInterval | None,
+    second_previous_click: ClickInterval | None,
+    second_next_click: ClickInterval | None,
+    rng: Random,
+) -> KeyInterval:
+    start_anchor = spinner_boundary_anchor(
+        first_previous_click.end_ms if first_previous_click is not None else None,
+        second_previous_click.end_ms if second_previous_click is not None else None,
+        fallback=obj.time_ms,
+        take_max=True,
+    )
+    end_anchor = spinner_boundary_anchor(
+        first_next_click.start_ms if first_next_click is not None else None,
+        second_next_click.start_ms if second_next_click is not None else None,
+        fallback=obj.resolved_end_time_ms,
+        take_max=False,
+    )
+
+    start_ms = spinner_boundary_time(start_anchor, obj.time_ms, rng)
+    end_ms = spinner_boundary_time(end_anchor, obj.resolved_end_time_ms, rng)
+    if end_ms <= start_ms:
+        end_ms = start_ms + 1
+    return KeyInterval(start_ms, end_ms)
+
+
+def spinner_boundary_anchor(
+    first_time: int | None,
+    second_time: int | None,
+    *,
+    fallback: int,
+    take_max: bool,
+) -> int:
+    if first_time is None and second_time is None:
+        return fallback
+    if first_time is None:
+        return second_time if second_time is not None else fallback
+    if second_time is None:
+        return first_time
+    return max(first_time, second_time) if take_max else min(first_time, second_time)
+
+
+def spinner_boundary_time(t1: int, t2: int, rng: Random) -> int:
+    delta = abs(t1 - t2)
+    mean = (t1 + 3 * t2) / 4.0
+    if delta == 0:
+        return round(mean)
+
+    sigma = delta / 4.0
+    epsilon = bounded_normal(rng, sigma)
+    return round(mean + epsilon)
+
+
+def bounded_normal(rng: Random, sigma: float) -> float:
+    if sigma <= 0:
+        return 0.0
+
+    bound = sigma
+    epsilon = 0.0
+    for _ in range(32):
+        epsilon = rng.gauss(0.0, sigma)
+        if abs(epsilon) < bound:
+            return epsilon
+    limit = nextafter(bound, 0.0)
+    return max(-limit, min(limit, epsilon))
+
+
+def align_object_clicks(objects: list[HitObject], clicks: list[ClickInterval | None]) -> list[ClickInterval | None]:
+    output: list[ClickInterval | None] = []
+    click_index = 0
+    for obj in objects:
+        if obj.is_clickable:
+            output.append(clicks[click_index])
+            click_index += 1
+        else:
+            output.append(None)
+    return output
+
+
+def previous_effective_clicks(clicks: list[ClickInterval | None]) -> list[ClickInterval | None]:
+    output: list[ClickInterval | None] = []
+    previous: ClickInterval | None = None
+    for click in clicks:
+        output.append(previous)
+        if click is not None:
+            previous = click
+    return output
+
+
+def next_effective_clicks(clicks: list[ClickInterval | None]) -> list[ClickInterval | None]:
+    output: list[ClickInterval | None] = [None] * len(clicks)
+    next_click: ClickInterval | None = None
+    for index in range(len(clicks) - 1, -1, -1):
+        output[index] = next_click
+        if clicks[index] is not None:
+            next_click = clicks[index]
     return output
 
 
@@ -564,14 +961,29 @@ def iter_key_bits(key_mask: int) -> list[int]:
     return bits
 
 
-def average_seed(first_seed: int | None, second_seed: int | None) -> int | None:
+def average_seed(
+    first_seed: int | None,
+    second_seed: int | None,
+    *,
+    first_weight: float = 1.0,
+    second_weight: float = 1.0,
+) -> int | None:
+    return average_seed_weighted(first_seed, second_seed, first_weight, second_weight)
+
+
+def average_seed_weighted(
+    first_seed: int | None,
+    second_seed: int | None,
+    first_weight: float,
+    second_weight: float,
+) -> int | None:
     if first_seed is None and second_seed is None:
         return None
     if first_seed is None:
         return second_seed
     if second_seed is None:
         return first_seed
-    return round((first_seed + second_seed) / 2)
+    return round(weighted_average_pair(first_seed, second_seed, first_weight, second_weight))
 
 
 def earliest_time(first: int | None, second: int | None) -> int | None:
@@ -584,3 +996,27 @@ def earliest_time(first: int | None, second: int | None) -> int | None:
 
 def default_lazer_skip_target_ms(first_hit_object_time_ms: int) -> int:
     return max(0, first_hit_object_time_ms - LAZER_MINIMUM_SKIP_TIME_MS)
+
+
+def validate_weights(first_weight: float, second_weight: float) -> None:
+    if not isfinite(first_weight) or not isfinite(second_weight):
+        raise SynthesisError("weights must be finite")
+    if first_weight < 0 or second_weight < 0:
+        raise SynthesisError("weights must be non-negative")
+    if first_weight == 0 and second_weight == 0:
+        raise SynthesisError("at least one weight must be positive")
+
+
+def spinner_noise_seed(
+    first: OsrReplay,
+    second: OsrReplay,
+    beatmap: Beatmap,
+) -> int:
+    digest = hashlib.blake2b(digest_size=16)
+    for part in (
+        beatmap.md5,
+        *sorted((first.replay_md5, second.replay_md5)),
+    ):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return int.from_bytes(digest.digest(), "big")

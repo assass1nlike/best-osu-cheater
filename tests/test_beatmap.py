@@ -36,5 +36,7 @@ AudioLeadIn:500
     assert [obj.time_ms for obj in beatmap.clickable_hit_objects] == [1000, 2000]
     assert beatmap.hit_objects[1].end_time_ms == 2500
     assert beatmap.hit_objects[1].slider_nested_hit_count == 1
+    assert beatmap.hit_objects[1].slider_curve_type == "B"
+    assert beatmap.hit_objects[1].slider_control_points == ((128.0, 96.0), (256.0, 96.0))
     assert beatmap.hit_objects[2].end_time_ms == 4000
     assert beatmap.max_combo == 4
