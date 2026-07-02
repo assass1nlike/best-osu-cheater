@@ -1,30 +1,32 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import atan2, degrees, dist
 
 from .beatmap import Beatmap, HitObject
+from .mods import (
+    MOD_AUTOPILOT,
+    MOD_DOUBLE_TIME,
+    MOD_EASY,
+    MOD_FLASHLIGHT,
+    MOD_HALF_TIME,
+    MOD_HARD_ROCK,
+    MOD_HIDDEN,
+    MOD_NIGHTCORE,
+    MOD_NO_FAIL,
+    MOD_RELAX,
+    MOD_SPUN_OUT,
+    MOD_SUDDEN_DEATH,
+)
 from .osr import OsrReplay, ReplayFrame, decode_lazer_replay_metadata
 
-
-MOD_EASY = 1 << 1
-MOD_NO_FAIL = 1 << 0
-MOD_HIDDEN = 1 << 3
-MOD_HARD_ROCK = 1 << 4
-MOD_SUDDEN_DEATH = 1 << 5
-MOD_DOUBLE_TIME = 1 << 6
-MOD_RELAX = 1 << 7
-MOD_HALF_TIME = 1 << 8
-MOD_FLASHLIGHT = 1 << 10
-MOD_NIGHTCORE = 1 << 9
-MOD_AUTOPILOT = 1 << 13
-MOD_SPUN_OUT = 1 << 12
 
 JUDGEMENT_300 = 300
 JUDGEMENT_100 = 100
 JUDGEMENT_50 = 50
 JUDGEMENT_MISS = 0
+OSU_STANDARD_PLAYFIELD_HEIGHT = 384.0
 
 
 @dataclass(frozen=True)
@@ -151,7 +153,7 @@ def score_replay(replay: OsrReplay, beatmap: Beatmap) -> ScoreMetadata:
     used_clicks: set[int] = set()
     results: list[ObjectResult] = []
 
-    for obj in beatmap.hit_objects:
+    for obj in modded_hit_objects(beatmap.hit_objects, replay.mods):
         if obj.is_circle or obj.is_slider:
             result = judge_click_object(
                 obj,
@@ -230,6 +232,22 @@ def ruleset_difficulty(beatmap: Beatmap, mods: int) -> RulesetDifficulty:
         hit_window_100_ms=round(140 - 8 * od),
         hit_window_50_ms=round(200 - 10 * od),
     )
+
+
+def modded_hit_objects(objects: tuple[HitObject, ...], mods: int) -> list[HitObject]:
+    if not mods & MOD_HARD_ROCK:
+        return list(objects)
+    return [
+        replace(
+            obj,
+            y=OSU_STANDARD_PLAYFIELD_HEIGHT - obj.y,
+            slider_control_points=tuple(
+                (x, OSU_STANDARD_PLAYFIELD_HEIGHT - y)
+                for x, y in obj.slider_control_points
+            ),
+        )
+        for obj in objects
+    ]
 
 
 def mod_clock_rate(mods: int) -> float:

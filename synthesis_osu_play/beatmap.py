@@ -32,6 +32,8 @@ class HitObject:
     repeat_count: int = 1
     pixel_length: float = 0.0
     slider_nested_hit_count: int = 0
+    slider_curve_type: str = ""
+    slider_control_points: tuple[tuple[float, float], ...] = ()
 
     @property
     def is_clickable(self) -> bool:
@@ -206,7 +208,11 @@ def parse_hit_object(
         repeat_count = 1
         pixel_length = 0.0
         slider_nested_hit_count = 0
+        slider_curve_type = ""
+        slider_control_points: tuple[tuple[float, float], ...] = ()
         if type_flags & SLIDER and len(parts) >= 8:
+            curve_type, slider_control_points = parse_slider_path(parts[5], float(parts[0]), float(parts[1]))
+            slider_curve_type = curve_type
             repeat_count = max(1, int(parts[6]))
             pixel_length = max(0.0, float(parts[7]))
             duration = slider_duration_ms(
@@ -235,9 +241,25 @@ def parse_hit_object(
             repeat_count=repeat_count,
             pixel_length=pixel_length,
             slider_nested_hit_count=slider_nested_hit_count,
+            slider_curve_type=slider_curve_type,
+            slider_control_points=slider_control_points,
         )
     except ValueError as exc:
         raise BeatmapFormatError(f"invalid hit object values: {line!r}") from exc
+
+
+def parse_slider_path(path: str, start_x: float, start_y: float) -> tuple[str, tuple[tuple[float, float], ...]]:
+    if not path:
+        return "", ((start_x, start_y),)
+    raw_parts = path.split("|")
+    curve_type = raw_parts[0]
+    points = [(start_x, start_y)]
+    for raw_point in raw_parts[1:]:
+        if ":" not in raw_point:
+            raise BeatmapFormatError(f"invalid slider control point: {raw_point!r}")
+        raw_x, raw_y = raw_point.split(":", 1)
+        points.append((float(raw_x), float(raw_y)))
+    return curve_type, tuple(points)
 
 
 def slider_duration_ms(
