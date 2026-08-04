@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import synthesis_osu_play.cli as cli_module
 from synthesis_osu_play.cli import main
 from synthesis_osu_play.online import BatchSynthesisItem, BatchSynthesisReport, LeaderboardScore, OnlineSynthesisReport
 from synthesis_osu_play.osr import OsrReplay, ReplayFrame, encode_lazer_replay_metadata
-from synthesis_osu_play.synthesis import LEGACY_Z_KEY, SynthesisReport
+from synthesis_osu_play.synthesis import LEGACY_Z_KEY, SynthesisReport, effective_weights
 
 
 def make_replay(path: Path, frames: tuple[ReplayFrame, ...]) -> None:
@@ -31,6 +33,35 @@ def make_replay(path: Path, frames: tuple[ReplayFrame, ...]) -> None:
         online_score_id=0,
     )
     replay.write_path(path)
+
+
+def test_parser_exposes_playback_controls(tmp_path: Path) -> None:
+    parser = cli_module.build_parser()
+
+    synthesize = parser.parse_args([
+        "synthesize",
+        "first.osr",
+        "second.osr",
+        "output.osr",
+        "--no-dt",
+    ])
+    assert synthesize.dt is False
+
+    batch = parser.parse_args(["batch-dt", "1", "--no-skip-filter"])
+    assert batch.no_skip_filter is True
+    assert batch.spinner_mode == "all"
+    assert batch.dt is True
+
+    download = parser.parse_args([
+        "download-synthesize",
+        "123",
+        "1",
+        "2",
+        "output.osr",
+        "--lazer-path",
+        str(tmp_path / "lazer"),
+    ])
+    assert download.lazer_path == tmp_path / "lazer"
 
 
 def test_synthesize_command_writes_readable_osr(tmp_path: Path) -> None:
@@ -107,8 +138,9 @@ def test_synthesize_command_accepts_weights(tmp_path: Path) -> None:
 
     assert exit_code == 0
     output = OsrReplay.read_path(output_path)
-    assert output.frames[1].x == 2.5
-    assert output.frames[1].y == 2.5
+    first_weight, second_weight = effective_weights(10, 3.0, 1.0)
+    assert output.frames[1].x == pytest.approx(10.0 * second_weight)
+    assert output.frames[1].y == pytest.approx(10.0 * second_weight)
 
 
 def test_synthesize_command_writes_lazer_json(tmp_path: Path) -> None:

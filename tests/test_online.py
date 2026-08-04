@@ -1,5 +1,7 @@
 import hashlib
 import io
+import ssl
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -7,12 +9,14 @@ import pytest
 
 from synthesis_osu_play.online import (
     MAX_SCORE_REQUEST_LIMIT,
+    OsuApiClient,
     BatchSynthesisItem,
     BatchSynthesisReport,
     LeaderboardScore,
     OnlineSynthesisError,
     batch_beatmap_archive_paths,
     batch_synthesize_dt,
+    api_ssl_context,
     choose_batch_scores,
     default_lazer_game_ini,
     download_and_synthesize,
@@ -212,6 +216,32 @@ def test_parse_lazer_token_reads_lazer_pipe_format() -> None:
     assert token.refresh_token == "refresh-token"
 
 
+def test_api_ssl_context_handles_unexpected_eof_without_disabling_verification() -> None:
+    context = api_ssl_context()
+
+    assert context.check_hostname
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        assert context.options & ssl.OP_IGNORE_UNEXPECTED_EOF
+
+
+def test_api_client_retries_transient_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+
+    def fake_urlopen(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.URLError(ConnectionResetError(10054, "connection reset"))
+        return FakeResponse(b"ok")
+
+    monkeypatch.setattr("synthesis_osu_play.online.time.sleep", lambda _seconds: None)
+    client = OsuApiClient("token", urlopen=fake_urlopen)
+
+    assert client.get_bytes("health") == b"ok"
+    assert attempts == 2
+
+
 def test_refresh_lazer_token_uses_refresh_token() -> None:
     seen = {}
 
@@ -329,7 +359,7 @@ def test_download_and_synthesize_rejects_ranks_beyond_endpoint_limit(tmp_path: P
         download_and_synthesize(123, 1, MAX_SCORE_REQUEST_LIMIT + 1, tmp_path / "output.osr", client=FakeClient())
 
 
-def test_choose_batch_scores_prefers_dt_without_hr() -> None:
+def test_choose_batch_scores_randomly_selects_only_supported_mods() -> None:
     scores = [
         leaderboard_score_at_index(
             1,
@@ -344,7 +374,7 @@ def test_choose_batch_scores_prefers_dt_without_hr() -> None:
             {
                 "id": 2,
                 "has_replay": True,
-                "mods": [{"acronym": "DT"}],
+                "mods": [{"acronym": "HR"}, {"acronym": "DT"}],
             },
         ),
         leaderboard_score_at_index(
@@ -352,7 +382,7 @@ def test_choose_batch_scores_prefers_dt_without_hr() -> None:
             {
                 "id": 3,
                 "has_replay": True,
-                "mods": [{"acronym": "NC"}],
+                "mods": [{"acronym": "EZ"}, {"acronym": "NF"}, {"acronym": "DC"}],
             },
         ),
         leaderboard_score_at_index(
@@ -360,17 +390,35 @@ def test_choose_batch_scores_prefers_dt_without_hr() -> None:
             {
                 "id": 4,
                 "has_replay": True,
-                "mods": [],
+                "mods": [{"acronym": "FL"}, {"acronym": "CL"}],
+            },
+        ),
+        leaderboard_score_at_index(
+            5,
+            {
+                "id": 5,
+                "has_replay": True,
+                "mods": [{"acronym": "RX"}],
             },
         ),
     ]
 
-    selected = choose_batch_scores(scores, __import__("random").Random(1))
+    class RecordingRandom:
+        def __init__(self) -> None:
+            self.population: list[LeaderboardScore] = []
+
+        def sample(self, population: list[LeaderboardScore], count: int) -> list[LeaderboardScore]:
+            self.population = population
+            return population[:count]
+
+    rng = RecordingRandom()
+    selected = choose_batch_scores(scores, rng)
 
     assert selected is not None
     first, second, pool = selected
-    assert pool == "dt_no_hr"
-    assert {first.rank, second.rank} == {2, 3}
+    assert pool == "supported_random"
+    assert {score.rank for score in rng.population} == {1, 2, 3, 4}
+    assert {first.rank, second.rank} == {1, 2}
 
 
 def test_batch_synthesize_dt_writes_beatmap_id_outputs_and_manifest(tmp_path: Path) -> None:
@@ -385,6 +433,7 @@ def test_batch_synthesize_dt_writes_beatmap_id_outputs_and_manifest(tmp_path: Pa
         request_delay_s=0,
         random_seed=1,
         client=FakeBatchClient(),
+        min_skip_time_ms=0,
     )
 
     output = OsrReplay.read_path(tmp_path / "exports" / "10001.osr")
@@ -392,7 +441,7 @@ def test_batch_synthesize_dt_writes_beatmap_id_outputs_and_manifest(tmp_path: Pa
     assert output.player_name == "synthetic"
     assert output.mods == 64
     assert report.items[0].beatmap_id == 10001
-    assert report.items[0].selection_pool == "dt_no_hr"
+    assert report.items[0].selection_pool == "supported_random"
     assert report.manifest_path.exists()
     assert (tmp_path / "work" / "10001" / "beatmapset_20001.osz").exists()
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from .visualize import (
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -73,13 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--first-weight",
         type=float,
         default=1.0,
-        help="weight applied to the first replay when averaging shared data",
+        help="multiplier applied to the first replay's dynamic blend weight",
     )
     synthesize.add_argument(
         "--second-weight",
         type=float,
         default=1.0,
-        help="weight applied to the second replay when averaging shared data",
+        help="multiplier applied to the second replay's dynamic blend weight",
     )
     synthesize.add_argument(
         "--allow-key-mismatch",
@@ -119,7 +122,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--spinner-library",
         type=Path,
         default=None,
-        help="spinner trajectory library JSON for replacing low-RPM spinners",
+        help="spinner trajectory library JSON; defaults to the bundled library",
+    )
+    synthesize.add_argument(
+        "--spinner-mode",
+        default="all",
+        choices=("all", "threshold", "never"),
+        help="spinner replacement mode: all | threshold | never (default: all)",
+    )
+    synthesize.add_argument(
+        "--dt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="assume DT playback for spinner RPM checks; use --no-dt to disable (default: on)",
     )
     synthesize.add_argument(
         "--greedy-match",
@@ -150,13 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--first-weight",
         type=float,
         default=1.0,
-        help="weight applied to the first replay when averaging shared data",
+        help="multiplier applied to the first replay's dynamic blend weight",
     )
     download_synthesize.add_argument(
         "--second-weight",
         type=float,
         default=1.0,
-        help="weight applied to the second replay when averaging shared data",
+        help="multiplier applied to the second replay's dynamic blend weight",
     )
     download_synthesize.add_argument(
         "--mods",
@@ -204,6 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="download beatmapset video assets too",
     )
     download_synthesize.add_argument(
+        "--lazer-path",
+        type=Path,
+        default=None,
+        help="osu!lazer install directory or osu!.exe used for automatic beatmap import; defaults to OSU_LAZER_PATH or %%LOCALAPPDATA%%\\osulazer\\current",
+    )
+    download_synthesize.add_argument(
         "--lazer-json",
         type=Path,
         default=None,
@@ -213,6 +234,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-score",
         action="store_true",
         help="debug fallback: recompute score metadata locally instead of leaving provisional metadata",
+    )
+    download_synthesize.add_argument(
+        "--spinner-library",
+        type=Path,
+        default=None,
+        help="spinner trajectory library JSON; defaults to the bundled library",
+    )
+    download_synthesize.add_argument(
+        "--spinner-mode",
+        default="all",
+        choices=("all", "threshold", "never"),
+        help="spinner replacement mode: all | threshold | never (default: all)",
+    )
+    download_synthesize.add_argument(
+        "--dt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="assume DT playback for spinner RPM checks; use --no-dt to disable (default: on)",
+    )
+    download_synthesize.add_argument(
+        "--greedy-match",
+        action="store_true",
+        help="use greedy matching instead of the default sequential matching",
     )
     add_debug_video_arguments(download_synthesize)
     batch_dt = subparsers.add_parser(
@@ -247,8 +291,37 @@ def build_parser() -> argparse.ArgumentParser:
     batch_dt.add_argument(
         "--max-star",
         type=float,
-        default=5.5,
-        help="maximum star rating; defaults to 5.5",
+        default=5.0,
+        help="maximum star rating; defaults to 5.0",
+    )
+    batch_dt.add_argument(
+        "--min-skip-time",
+        type=int,
+        default=4000,
+        help="minimum first hit object time in ms for skip-ready beatmaps; 0 disables the filter (default: 4000)",
+    )
+    batch_dt.add_argument(
+        "--no-skip-filter",
+        action="store_true",
+        help="include beatmaps even when the first note is too early for stable skip-intro playback",
+    )
+    batch_dt.add_argument(
+        "--spinner-library",
+        type=Path,
+        default=None,
+        help="spinner trajectory library JSON; defaults to the bundled library",
+    )
+    batch_dt.add_argument(
+        "--spinner-mode",
+        default="all",
+        choices=("all", "threshold", "never"),
+        help="spinner replacement mode: all | threshold | never (default: all)",
+    )
+    batch_dt.add_argument(
+        "--dt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="assume DT playback for spinner RPM checks; use --no-dt to disable (default: on)",
     )
     batch_dt.add_argument(
         "--player-name",
@@ -270,8 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
     batch_dt.add_argument(
         "--request-delay-s",
         type=float,
-        default=1.0,
-        help="minimum delay between osu! API requests; defaults to 1 second",
+        default=2.0,
+        help="minimum delay between osu! API requests; defaults to 2 seconds",
     )
     batch_dt.add_argument(
         "--random-seed",
@@ -311,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lazer-path",
         type=Path,
         default=None,
-        help="osu!lazer install directory or osu!.exe used for post-batch import; defaults to OSU_LAZER_PATH or %LOCALAPPDATA%\\osulazer\\current",
+        help="osu!lazer install directory or osu!.exe used for post-batch import; defaults to OSU_LAZER_PATH or %%LOCALAPPDATA%%\\osulazer\\current",
     )
     finalize = subparsers.add_parser(
         "finalize",
@@ -399,8 +472,10 @@ def synthesize_command(args: argparse.Namespace) -> int:
         second_skip_ms=args.second_skip_ms,
         intro_end_ms=args.intro_end_ms,
         recompute_score_metadata=args.local_score,
-        spinner_library_path=str(args.spinner_library) if args.spinner_library else None,
+        spinner_library_path=str(args.spinner_library) if (args.spinner_library and args.spinner_mode != "never") else None,
         sequential_match=not args.greedy_match,
+        dt_mode=args.dt,
+        spinner_mode=args.spinner_mode,
     )
     result.replay.write_path(args.output)
     if args.debug_video is not None:
@@ -497,6 +572,10 @@ def download_synthesize_command(args: argparse.Namespace) -> int:
         debug_video_fps=args.debug_video_fps,
         debug_video_speed=args.debug_video_speed,
         debug_video_size=parse_video_size(args.debug_video_size),
+        spinner_library_path=str(args.spinner_library) if (args.spinner_library and args.spinner_mode != "never") else None,
+        sequential_match=not args.greedy_match,
+        dt_mode=args.dt,
+        spinner_mode=args.spinner_mode,
     )
     print(
         "wrote "
@@ -528,10 +607,29 @@ def download_synthesize_command(args: argparse.Namespace) -> int:
         print(f"wrote debug video {report.debug_video_path}")
     if not args.local_score:
         print("score metadata is provisional; run this replay in osu!lazer and finalize it from a lazer-scored metadata source")
+
+    # Import beatmap into osu!lazer
+    from .online import resolve_lazer_executable
+    work = report.work_dir or (Path(args.work_dir) if args.work_dir else Path("artifacts") / str(args.beatmap_id))
+    osz_candidates = sorted(Path(work).glob("beatmapset_*.osz"))
+    if osz_candidates:
+        lazer_exe = resolve_lazer_executable(args.lazer_path)
+        for osz in osz_candidates:
+            try:
+                subprocess.Popen(
+                    [str(lazer_exe), str(osz)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+                )
+                print(f"imported beatmapset: {osz}")
+                break
+            except OSError as exc:
+                print(f"warning: could not import beatmapset {osz}: {exc}", file=sys.stderr)
     return 0
 
 
 def batch_dt_command(args: argparse.Namespace) -> int:
+    min_skip_time_ms = 0 if args.no_skip_filter else args.min_skip_time
     report = batch_synthesize_dt(
         args.count,
         output_dir=args.output_dir,
@@ -549,6 +647,12 @@ def batch_dt_command(args: argparse.Namespace) -> int:
         search_pages_limit=args.search_pages_limit,
         request_delay_s=args.request_delay_s,
         random_seed=args.random_seed,
+        min_skip_time_ms=min_skip_time_ms,
+        spinner_library_path=(
+            str(args.spinner_library) if (args.spinner_library and args.spinner_mode != "never") else None
+        ),
+        spinner_mode=args.spinner_mode,
+        dt_mode=args.dt,
     )
     imported_archives = import_batch_beatmaps(report, lazer_path=args.lazer_path)
     print(f"wrote {len(report.items)} DT replay(s) to {report.output_dir}")

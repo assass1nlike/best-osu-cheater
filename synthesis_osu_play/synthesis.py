@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import hashlib
+import logging
+import random
 from dataclasses import dataclass, replace
 from math import dist, isfinite, nextafter
 from random import Random
+from typing import TYPE_CHECKING
 
 from .beatmap import Beatmap, HitObject
 from .mods import (
@@ -17,6 +20,12 @@ from .mods import (
     speed_mod_category,
 )
 from .osr import OsrReplay, ReplayFrame
+
+if TYPE_CHECKING:
+    from .spinner_replace import SpinnerReplacement
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 OSU_STANDARD_MODE = 0
@@ -32,6 +41,8 @@ LEGACY_Z_KEY = LEGACY_LEFT_BUTTON | LEGACY_KEY_1
 LEGACY_X_KEY = LEGACY_RIGHT_BUTTON | LEGACY_KEY_2
 LEGACY_LEFT_ACTION_MASK = LEGACY_LEFT_BUTTON | LEGACY_KEY_1
 LEGACY_RIGHT_ACTION_MASK = LEGACY_RIGHT_BUTTON | LEGACY_KEY_2
+PRIMARY_KEY_REPEAT_THRESHOLD_MS = 500
+PRIMARY_KEY_REPEAT_THRESHOLD_JITTER_MS = 100
 LEGACY_INPUT_ACTION_MASKS = (
     (LEGACY_Z_KEY, LEGACY_LEFT_ACTION_MASK),
     (LEGACY_X_KEY, LEGACY_RIGHT_ACTION_MASK),
@@ -77,7 +88,7 @@ class SynthesisReport:
     dropped_object_count: int = 0
     skip_press_ms: int | None = None
     intro_end_ms: int | None = None
-    spinner_replacements: list | None = None
+    spinner_replacements: list[SpinnerReplacement] | None = None
 
 
 @dataclass(frozen=True)
@@ -106,11 +117,21 @@ def synthesize_replays(
     intro_end_ms: int | None = None,
     recompute_score_metadata: bool = False,
     output_mods: int | None = None,
+    allow_source_mod_mismatch: bool = False,
     spinner_library_path: str | None = None,
     sequential_match: bool = True,
+    dt_mode: bool = False,
+    spinner_mode: str = "all",
 ) -> SynthesizedReplay:
     validate_weights(first_weight, second_weight)
-    compatibility = validate_compatible(first, second, output_mods=output_mods)
+    if spinner_mode not in {"all", "threshold", "never"}:
+        raise SynthesisError(f"unknown spinner replacement mode: {spinner_mode}")
+    compatibility = validate_compatible(
+        first,
+        second,
+        output_mods=output_mods,
+        allow_source_mod_mismatch=allow_source_mod_mismatch,
+    )
     first_frames, first_seed = split_sentinel(first.frames)
     second_frames, second_seed = split_sentinel(second.frames)
     first_absolute = normalize_absolute_frames(
@@ -181,9 +202,12 @@ def synthesize_replays(
         )
         for time_ms in output_times
     ]
-    # --- spinner trajectory replacement ---
-    spinner_replacements: list = []
-    if spinner_library_path is not None and beatmap is not None:
+    spinner_replacements: list[SpinnerReplacement] = []
+    if spinner_library_path is None and beatmap is not None and spinner_mode != "never":
+        from .spinner_replace import DEFAULT_SPINNER_LIBRARY_PATH
+
+        spinner_library_path = str(DEFAULT_SPINNER_LIBRARY_PATH)
+    if spinner_library_path is not None and spinner_mode != "never" and beatmap is not None:
         spinner_intervals = [
             (obj.time_ms, obj.resolved_end_time_ms)
             for obj in beatmap.hit_objects
@@ -191,12 +215,20 @@ def synthesize_replays(
         ]
         if spinner_intervals:
             from .spinner_replace import replace_spinner_segments
+            LOGGER.info("spinner check: %s spinners, library=%s", len(spinner_intervals), spinner_library_path)
             output_absolute, spinner_replacements = replace_spinner_segments(
                 output_absolute,
                 list(beatmap.hit_objects),
                 spinner_intervals,
                 library_path=spinner_library_path,
+                dt_mode=dt_mode,
+                spinner_mode=spinner_mode,
             )
+            LOGGER.info("spinners replaced: %s/%s", len(spinner_replacements), len(spinner_intervals))
+        else:
+            LOGGER.info("spinner check: no spinners in this beatmap")
+    elif spinner_library_path is not None and spinner_mode != "never":
+        LOGGER.info("spinner check: no beatmap loaded, skipping")
 
     output_frames = to_delta_frames(output_absolute)
     seed = average_seed(
@@ -264,6 +296,7 @@ def average_position_at_time(
     skip_press_ms: int | None = None,
     intro_end_ms: int | None = None,
 ) -> tuple[float, float]:
+    w1, w2 = effective_weights(time_ms, first_weight, second_weight)
     first_x, first_y = interpolate_position(first, time_ms)
     second_x, second_y = interpolate_position(second, time_ms)
     if skip_press_ms is not None and intro_end_ms is not None and intro_end_ms > skip_press_ms and time_ms <= skip_press_ms:
@@ -275,16 +308,22 @@ def average_position_at_time(
             second_weight=second_weight,
         )
         return (
-            weighted_average_three(first_x, second_x, anchor_x, first_weight, second_weight, 1.0),
-            weighted_average_three(first_y, second_y, anchor_y, first_weight, second_weight, 1.0),
+            weighted_average_three(first_x, second_x, anchor_x, w1, w2, 1.0),
+            weighted_average_three(first_y, second_y, anchor_y, w1, w2, 1.0),
         )
     return (
-        weighted_average_pair(first_x, second_x, first_weight, second_weight),
-        weighted_average_pair(first_y, second_y, first_weight, second_weight),
+        weighted_average_pair(first_x, second_x, w1, w2),
+        weighted_average_pair(first_y, second_y, w1, w2),
     )
 
 
-def validate_compatible(first: OsrReplay, second: OsrReplay, *, output_mods: int | None = None) -> ReplayCompatibility:
+def validate_compatible(
+    first: OsrReplay,
+    second: OsrReplay,
+    *,
+    output_mods: int | None = None,
+    allow_source_mod_mismatch: bool = False,
+) -> ReplayCompatibility:
     if first.mode != second.mode:
         raise SynthesisError(f"replay modes differ: {first.mode} != {second.mode}")
     if first.mode != OSU_STANDARD_MODE:
@@ -293,8 +332,18 @@ def validate_compatible(first: OsrReplay, second: OsrReplay, *, output_mods: int
         raise SynthesisError("beatmap MD5 hashes differ")
     if output_mods is None:
         return ReplayCompatibility(output_mods=synthesis_output_mods(first.mods, second.mods))
-    validate_replay_mods_against_output(first.mods, output_mods, "first")
-    validate_replay_mods_against_output(second.mods, output_mods, "second")
+    validate_replay_mods_against_output(
+        first.mods,
+        output_mods,
+        "first",
+        require_base_match=not allow_source_mod_mismatch,
+    )
+    validate_replay_mods_against_output(
+        second.mods,
+        output_mods,
+        "second",
+        require_base_match=not allow_source_mod_mismatch,
+    )
     return ReplayCompatibility(output_mods=output_mods)
 
 
@@ -326,12 +375,18 @@ def replay_speed_category(mods: int, label: str) -> str:
         raise SynthesisError(f"{label} replay has conflicting speed mods: {mods}") from exc
 
 
-def validate_replay_mods_against_output(source_mods: int, output_mods: int, label: str) -> None:
+def validate_replay_mods_against_output(
+    source_mods: int,
+    output_mods: int,
+    label: str,
+    *,
+    require_base_match: bool = True,
+) -> None:
     replay_speed_category(source_mods, label)
     replay_speed_category(output_mods, "output")
     source_base = source_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
     output_base = output_mods & ~SYNTHESIS_VARIABLE_MOD_MASK
-    if source_base != output_base:
+    if require_base_match and source_base != output_base:
         raise SynthesisError(
             f"{label} replay mods cannot be normalized to output mods: "
             f"{source_mods} -> {output_mods}"
@@ -433,8 +488,10 @@ def average_key_intervals(
         for index in range(paired_count):
             first_interval = first_intervals[index]
             second_interval = second_intervals[index]
-            start = round(weighted_average_pair(first_interval.start_ms, second_interval.start_ms, first_weight, second_weight))
-            end = round(weighted_average_pair(first_interval.end_ms, second_interval.end_ms, first_weight, second_weight))
+            mid_ms = (first_interval.start_ms + second_interval.start_ms) // 2
+            w1, w2 = effective_weights(mid_ms, first_weight, second_weight)
+            start = round(weighted_average_pair(first_interval.start_ms, second_interval.start_ms, w1, w2))
+            end = round(weighted_average_pair(first_interval.end_ms, second_interval.end_ms, w1, w2))
             if end > start:
                 intervals.append(KeyInterval(start, end))
         output[bit] = intervals
@@ -546,8 +603,9 @@ def synthesize_key_intervals_for_beatmap(
             if first_click is None or second_click is None:
                 dropped_object_count += 1
                 continue
-            start = round(weighted_average_pair(first_click.start_ms, second_click.start_ms, first_weight, second_weight))
-            end = round(weighted_average_pair(first_click.end_ms, second_click.end_ms, first_weight, second_weight))
+            w1, w2 = effective_weights(obj.time_ms, first_weight, second_weight)
+            start = round(weighted_average_pair(first_click.start_ms, second_click.start_ms, w1, w2))
+            end = round(weighted_average_pair(first_click.end_ms, second_click.end_ms, w1, w2))
             if end <= start:
                 end = start + 1
             averaged_intervals.append(KeyInterval(start, end))
@@ -565,7 +623,14 @@ def synthesize_key_intervals_for_beatmap(
             matched_object_count += 1
 
     ensure_no_triple_overlap(averaged_intervals)
-    return assign_alternating_keys(averaged_intervals), matched_object_count, dropped_object_count
+    return (
+        assign_natural_keys(
+            averaged_intervals,
+            repeat_threshold_ms=randomized_primary_key_repeat_threshold_ms(),
+        ),
+        matched_object_count,
+        dropped_object_count,
+    )
 
 
 def match_effective_clicks(
@@ -799,11 +864,40 @@ def modded_circle_radius(beatmap: Beatmap, mods: int) -> float:
     return 54.4 - 4.48 * cs
 
 
-def assign_alternating_keys(intervals: list[KeyInterval]) -> dict[int, list[KeyInterval]]:
-    output = {LEGACY_Z_KEY: [], LEGACY_X_KEY: []}
-    for index, interval in enumerate(sorted(intervals, key=lambda interval: (interval.start_ms, interval.end_ms))):
-        bit = LEGACY_Z_KEY if index % 2 == 0 else LEGACY_X_KEY
-        output[bit].append(interval)
+def randomized_primary_key_repeat_threshold_ms() -> float:
+    """Return the repeat threshold for one synthesis run."""
+    return PRIMARY_KEY_REPEAT_THRESHOLD_MS + random.uniform(
+        -PRIMARY_KEY_REPEAT_THRESHOLD_JITTER_MS,
+        PRIMARY_KEY_REPEAT_THRESHOLD_JITTER_MS,
+    )
+
+
+def assign_natural_keys(
+    intervals: list[KeyInterval],
+    *,
+    primary_key: int = LEGACY_Z_KEY,
+    secondary_key: int = LEGACY_X_KEY,
+    repeat_threshold_ms: float = PRIMARY_KEY_REPEAT_THRESHOLD_MS,
+) -> dict[int, list[KeyInterval]]:
+    """Assign note intervals using a primary-key repetition preference.
+
+    The first note uses ``primary_key``. A note assigned to the secondary key
+    is always followed by the primary key. Otherwise, the next note repeats the
+    primary key only when its start is more than ``repeat_threshold_ms`` later;
+    shorter gaps use the secondary key.
+    """
+    output = {primary_key: [], secondary_key: []}
+    ordered_intervals = sorted(intervals, key=lambda interval: (interval.start_ms, interval.end_ms))
+    current_key = primary_key
+    for index, interval in enumerate(ordered_intervals):
+        output[current_key].append(interval)
+        if index == len(ordered_intervals) - 1:
+            break
+        if current_key == secondary_key:
+            current_key = primary_key
+            continue
+        gap_ms = ordered_intervals[index + 1].start_ms - interval.start_ms
+        current_key = primary_key if gap_ms > repeat_threshold_ms else secondary_key
     return output
 
 
@@ -968,7 +1062,8 @@ def average_seed(
     first_weight: float = 1.0,
     second_weight: float = 1.0,
 ) -> int | None:
-    return average_seed_weighted(first_seed, second_seed, first_weight, second_weight)
+    first_blend_weight, second_blend_weight = effective_weights(0, first_weight, second_weight)
+    return average_seed_weighted(first_seed, second_seed, first_blend_weight, second_blend_weight)
 
 
 def average_seed_weighted(
@@ -996,6 +1091,27 @@ def earliest_time(first: int | None, second: int | None) -> int | None:
 
 def default_lazer_skip_target_ms(first_hit_object_time_ms: int) -> int:
     return max(0, first_hit_object_time_ms - LAZER_MINIMUM_SKIP_TIME_MS)
+
+
+def dynamic_first_weight(time_ms: int) -> float:
+    """Time-varying weight for the first replay.  f(t) ∈ [0, 1], period 30s."""
+    import math
+    t_sec = (time_ms / 1000.0) % 30.0
+    raw = 0.5 + 0.5 * math.sin(math.pi * t_sec / 15.0)
+    return max(0.0, min(1.0, raw))
+
+
+def effective_weights(time_ms: int, first_w: float, second_w: float) -> tuple[float, float]:
+    """Return (w1, w2) combining dynamic weight with user-specified modifier weights."""
+    dynamic_w1 = dynamic_first_weight(time_ms)
+    dynamic_w2 = 1.0 - dynamic_w1
+    # Apply user weights as secondary multipliers, then normalize
+    w1 = dynamic_w1 * first_w
+    w2 = dynamic_w2 * second_w
+    total = w1 + w2
+    if total <= 0:
+        return 0.5, 0.5
+    return w1 / total, w2 / total
 
 
 def validate_weights(first_weight: float, second_weight: float) -> None:

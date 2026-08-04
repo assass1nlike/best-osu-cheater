@@ -8,10 +8,10 @@ linear transitions at the spinner boundaries.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .osr import OsrReplay, ReplayFrame
 from .synthesis import (
@@ -21,15 +21,95 @@ from .synthesis import (
     OSU_STANDARD_PLAYFIELD_HEIGHT,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 _CENTER_X, _CENTER_Y = 256.0, 192.0
 _MIN_RPM = 225
-_MAX_RPM = 450
+_MAX_RPM = 500
+_DT_SPEED = 1.5
 _SLIDER_TAIL_LENIENCY_MS = 36
+DEFAULT_SPINNER_LIBRARY_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "artifacts"
+    / "spinner-trajectories"
+    / "spinner_trajectory_library.json"
+)
 
 
 # ---------------------------------------------------------------------------
 # RPM calculation
 # ---------------------------------------------------------------------------
+
+def _calc_rpm_for_segment(trajectory: list[dict], start_ms: float, end_ms: float) -> tuple[float, float]:
+    """Calculate RPM using net signed rotation.
+
+    Signed angles naturally cancel direction reversals.  No harsh
+    per-reversal reset that amplifies synthesis noise.
+    """
+    net_angle = 0.0
+    prev = None
+    for pt in trajectory:
+        t = pt["t_ms"]
+        if t < start_ms - 0.5:
+            continue
+        if t > end_ms + 0.5:
+            break
+        if prev is not None:
+            x1, y1 = prev["x"] - _CENTER_X, prev["y"] - _CENTER_Y
+            x2, y2 = pt["x"] - _CENTER_X, pt["y"] - _CENTER_Y
+            r1, r2 = math.hypot(x1, y1), math.hypot(x2, y2)
+            if r1 >= 1 and r2 >= 1:
+                net_angle += math.atan2(x1 * y2 - y1 * x2, x1 * x2 + y1 * y2)
+        prev = pt
+
+    dur = (end_ms - start_ms) / 1000.0
+    if dur <= 0:
+        return 0.0, 0.0
+    revs = abs(net_angle) / (2 * math.pi)
+    return revs / (dur / 60.0), revs
+
+
+def spinner_needs_replacement(trajectory: list[dict], threshold_rpm: float = _MIN_RPM, dt_mode: bool = False) -> bool:
+    """Return whether any complete one-second window is below the RPM threshold."""
+    if len(trajectory) < 2:
+        return True
+    duration_ms = trajectory[-1]["t_ms"] - trajectory[0]["t_ms"]
+    if duration_ms <= 1000:
+        return False
+
+    # Check each full second (including the first)
+    window_rpms = []
+    fail_windows = []
+    for window_start in range(0, int(duration_ms), 1000):
+        window_end = min(window_start + 1000, duration_ms)
+        if window_end - window_start < 1000:
+            break
+        rpm, _ = _calc_rpm_for_segment(trajectory, window_start, window_end)
+        display_rpm = rpm * (_DT_SPEED if dt_mode else 1.0)
+        display_thresh = threshold_rpm
+        window_rpms.append(display_rpm)
+        if display_rpm < display_thresh:
+            fail_windows.append((window_start, window_end, display_rpm))
+    if window_rpms:
+        status = 'FAIL' if fail_windows else 'pass'
+        LOGGER.info(
+            "RPM%s/sec: %s (thresh=%s) -> %s",
+            "x1.5 " if dt_mode else "",
+            [f"{r:.0f}" for r in window_rpms],
+            display_thresh,
+            status,
+        )
+        for ws, we, r in fail_windows:
+            LOGGER.info(
+                "window [%s-%s]ms: %.0f RPM%s < %s",
+                ws,
+                we,
+                r,
+                "x1.5" if dt_mode else "",
+                display_thresh,
+            )
+    return bool(fail_windows)
+
 
 def calc_spinner_rpm(trajectory: list[dict]) -> tuple[float, float]:
     """Return (avg_rpm, total_revolutions) from a trajectory."""
@@ -69,7 +149,7 @@ def spinner_rpm_from_absolute_frames(frames: list[AbsoluteFrame], start_ms: int,
 
 def _load_library(path: str | Path | None = None) -> list[dict]:
     if path is None:
-        path = Path(__file__).resolve().parent.parent / "artifacts" / "spinner-trajectories" / "spinner_trajectory_library.json"
+        path = DEFAULT_SPINNER_LIBRARY_PATH
     with open(path) as f:
         return json.load(f)["trajectories"]
 
@@ -107,12 +187,15 @@ def _score_candidate(
     target_duration_ms: int,
     target_start_pos: tuple[float, float],
     target_end_pos: tuple[float, float],
+    dt_mode: bool = False,
 ) -> float:
     """Score a library trajectory for suitability. Lower = better."""
     # Check RPM after scaling: revolutions stay the same, duration changes
     revs = lib_traj["total_revolutions"]
     scaled_rpm = revs * 60000 / target_duration_ms
-    if scaled_rpm < _MIN_RPM or scaled_rpm > _MAX_RPM:
+    speed = _DT_SPEED if dt_mode else 1.0
+    # When DT: scaled_rpm × speed must be in [MIN, MAX]
+    if scaled_rpm * speed < _MIN_RPM or scaled_rpm * speed > _MAX_RPM:
         return float("inf")
 
     # Cursor position match at start and end
@@ -131,12 +214,13 @@ def search_spinner_trajectories(
     target_duration_ms: int,
     target_start_pos: tuple[float, float],
     target_end_pos: tuple[float, float],
-    top_n: int = 3,
+    top_n: int = 2,
+    dt_mode: bool = False,
 ) -> list[dict]:
     """Search library for best matching spinner trajectories."""
     scored = []
     for t in library:
-        score = _score_candidate(t, target_duration_ms, target_start_pos, target_end_pos)
+        score = _score_candidate(t, target_duration_ms, target_start_pos, target_end_pos, dt_mode=dt_mode)
         if math.isfinite(score):
             scored.append((score, t))
     scored.sort(key=lambda x: x[0])
@@ -154,7 +238,7 @@ def blend_trajectories(
 ) -> list[tuple[float, float]]:
     """Blend multiple library trajectories into one, returning [(x, y), ...] at 1ms steps."""
     if weights is None:
-        weights = [0.6, 0.3, 0.1][:len(candidates)]
+        weights = [0.8, 0.2][:len(candidates)]
     # Normalize weights
     total_w = sum(weights[:len(candidates)])
     weights = [w / total_w for w in weights[:len(candidates)]]
@@ -236,51 +320,99 @@ def replace_spinner_segments(
     spinners: list[tuple[int, int]],  # [(start_ms, end_ms), ...]
     library_path: str | Path | None = None,
     rpm_threshold: float = _MIN_RPM,
+    dt_mode: bool = False,
+    spinner_mode: str = "all",
 ) -> tuple[list[AbsoluteFrame], list[SpinnerReplacement]]:
     """Replace spinner segments with library blends where RPM is below threshold.
 
     Returns (modified_absolute_frames, list_of_replacements).
     """
+    if spinner_mode not in {"all", "threshold", "never"}:
+        raise ValueError(f"unknown spinner replacement mode: {spinner_mode}")
+    if spinner_mode == "never":
+        return absolute_frames, []
+
     library = _load_library(library_path)
     replacements: list[SpinnerReplacement] = []
 
     for spin_idx, (sp_start_ms, sp_end_ms) in enumerate(spinners):
-        # Check RPM
-        rpm, revs = spinner_rpm_from_absolute_frames(absolute_frames, sp_start_ms, sp_end_ms)
-        if rpm >= rpm_threshold:
-            continue
-
+        # Build trajectory from absolute frames
+        spinner_traj = [
+            {"t_ms": f.time_ms - sp_start_ms, "x": f.x, "y": f.y}
+            for f in absolute_frames
+            if sp_start_ms <= f.time_ms <= sp_end_ms
+        ]
         duration_ms = sp_end_ms - sp_start_ms
+        if spinner_mode == 'all':
+            LOGGER.info(
+                "spinner %s: dur=%sms, traj_pts=%s -> REPLACE (all mode)",
+                spin_idx + 1,
+                duration_ms,
+                len(spinner_traj),
+            )
+        else:
+            needs = spinner_needs_replacement(spinner_traj, rpm_threshold, dt_mode=dt_mode)
+            if not needs:
+                LOGGER.info(
+                    "spinner %s: dur=%sms, traj_pts=%s -> pass",
+                    spin_idx + 1,
+                    duration_ms,
+                    len(spinner_traj),
+                )
+                continue
+            LOGGER.info(
+                "spinner %s: dur=%sms, traj_pts=%s -> REPLACE",
+                spin_idx + 1,
+                duration_ms,
+                len(spinner_traj),
+            )
+        rpm, _ = spinner_rpm_from_absolute_frames(absolute_frames, sp_start_ms, sp_end_ms)
         if duration_ms <= 0:
             continue
 
         # Find transition boundaries
         t1 = last_hit_time_before_spinner(hit_objects, sp_start_ms)
         t4 = first_hit_time_after_spinner(hit_objects, sp_end_ms)
-        if t1 is None or t4 is None:
-            continue
+        if t1 is None:
+            t1 = sp_start_ms  # first object: no transition in
+        if t4 is None:
+            t4 = sp_end_ms   # last object: no transition out
 
         t2 = sp_start_ms
         t3 = sp_end_ms
 
-        # Get cursor positions at spinner boundaries from synthesized replay
-        start_pos = _interpolate_pos(absolute_frames, sp_start_ms)
-        end_pos = _interpolate_pos(absolute_frames, sp_end_ms)
+        try:
+            start_pos = _interpolate_pos(absolute_frames, sp_start_ms)
+            end_pos = _interpolate_pos(absolute_frames, sp_end_ms)
+        except Exception as e:
+            LOGGER.warning("spinner position interpolation failed: %s", e)
+            continue
 
         # Search library
-        candidates = search_spinner_trajectories(library, duration_ms, start_pos, end_pos)
+        candidates = search_spinner_trajectories(library, duration_ms, start_pos, end_pos, dt_mode=dt_mode)
+        LOGGER.info(
+            "spinner search: %s candidates (pos=(%.0f,%.0f)->(%.0f,%.0f))",
+            len(candidates),
+            start_pos[0],
+            start_pos[1],
+            end_pos[0],
+            end_pos[1],
+        )
         if not candidates:
+            LOGGER.warning("no library match for %sms spinner", duration_ms)
             continue
 
         # Blend
-        weights = [0.6, 0.3, 0.1][:len(candidates)]
-        blended = blend_trajectories(candidates, duration_ms, weights)
-
-        # Calculate effective RPM of blended trajectory
-        eff_rpm, _ = calc_spinner_rpm([
-            {"t_ms": i, "x": pt[0], "y": pt[1]}
-            for i, pt in enumerate(blended)
-        ])
+        try:
+            weights = [0.8, 0.2][:len(candidates)]
+            blended = blend_trajectories(candidates, duration_ms, weights)
+            eff_rpm, _ = calc_spinner_rpm([
+                {"t_ms": i, "x": pt[0], "y": pt[1]}
+                for i, pt in enumerate(blended)
+            ])
+        except Exception as e:
+            LOGGER.warning("spinner blend failed: %s", e)
+            continue
 
         replacements.append(SpinnerReplacement(
             spinner_index=spin_idx,
@@ -345,36 +477,39 @@ def _apply_replacements(
         output_times.extend([r.t1_before_ms, r.t2_start_ms, r.t3_end_ms, r.t4_after_ms])
     output_times = sorted(set(output_times))
 
+    # Build key lookup (for times not in original, use nearest frame's keys)
+    sorted_orig = sorted(frames, key=lambda f: f.time_ms)
+    def key_at(t_ms: int) -> int:
+        lo, hi = 0, len(sorted_orig) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if sorted_orig[mid].time_ms == t_ms:
+                return sorted_orig[mid].keys
+            if sorted_orig[mid].time_ms < t_ms:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return sorted_orig[hi].keys if hi >= 0 else 0
+
     output: list[AbsoluteFrame] = []
     for t in output_times:
         x, y = _interpolate_pos(frames, t)
 
-        # Check if we're inside any replacement zone
+        # Check if inside replacement zone
         for r in replacements:
             if r.t1_before_ms < t < r.t4_after_ms:
-                # Get blended T position at the spinner-relative time
                 if t <= r.t2_start_ms:
-                    # Transition in: t1 -> t2
-                    if r.t2_start_ms > r.t1_before_ms:
-                        alpha = (t - r.t1_before_ms) / (r.t2_start_ms - r.t1_before_ms)
-                    else:
-                        alpha = 1.0
-                    # T position at spinner start
+                    denom = r.t2_start_ms - r.t1_before_ms
+                    alpha = (t - r.t1_before_ms) / denom if denom > 0 else 1.0
                     tx, ty = r.blended_trajectory[0]
                 elif t >= r.t3_end_ms:
-                    # Transition out: t3 -> t4
-                    if r.t4_after_ms > r.t3_end_ms:
-                        alpha = (r.t4_after_ms - t) / (r.t4_after_ms - r.t3_end_ms)
-                    else:
-                        alpha = 1.0
+                    denom = r.t4_after_ms - r.t3_end_ms
+                    alpha = (r.t4_after_ms - t) / denom if denom > 0 else 1.0
                     tx, ty = r.blended_trajectory[-1]
                 else:
-                    # In spinner: full T
                     offset_ms = int(t - r.t2_start_ms)
-                    if 0 <= offset_ms < len(r.blended_trajectory):
-                        tx, ty = r.blended_trajectory[offset_ms]
-                    else:
-                        tx, ty = r.blended_trajectory[-1]
+                    idx = min(offset_ms, len(r.blended_trajectory) - 1)
+                    tx, ty = r.blended_trajectory[max(0, idx)]
                     alpha = 1.0
 
                 alpha = max(0.0, min(1.0, alpha))
@@ -382,15 +517,6 @@ def _apply_replacements(
                 y = y * (1 - alpha) + ty * alpha
                 break
 
-        output.append(AbsoluteFrame(time_ms=t, x=x, y=y, keys=0))
+        output.append(AbsoluteFrame(time_ms=t, x=x, y=y, keys=key_at(t)))
 
-    # Copy keys from original frames (we don't change key timing)
-    _copy_keys_from_original(frames, output)
     return output
-
-
-def _copy_keys_from_original(original: list[AbsoluteFrame], output: list[AbsoluteFrame]) -> None:
-    """Copy key states from original frames to output frames at matching times."""
-    time_to_keys = {f.time_ms: f.keys for f in original}
-    for f in output:
-        f.keys = time_to_keys.get(f.time_ms, 0)
