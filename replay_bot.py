@@ -3,12 +3,20 @@ Replay Bot - SPACE trigger, skips long pauses instantly.
 With --auto-tune, connects to tosu to measure hit errors and auto-adjust timing.
 
 Usage:
-  python replay_bot.py <replay.osr> [--r 0.85] [--advance 175] [--k1 Z] [--k2 X]
+  python replay_bot.py <replay.osr> [--advance 0] [--k1 Z] [--k2 X]
                         [--auto-tune] [--tune-n 100] [--tune-threshold 10]
 """
-import ctypes, time, sys, argparse, json, threading, os, subprocess
+import ctypes, time, sys, argparse, json, threading, os, subprocess, urllib.request
 from ctypes import wintypes, byref, sizeof, Structure, Union
 from osrparse import Replay
+from lazer_clock_sync import (
+    ClockSyncError,
+    ReplayTimeline,
+    initial_key_mask,
+    start_clock_reader,
+    window_process_id,
+)
+from synthesis_osu_play.playfield import FullscreenPlayfield
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -83,10 +91,20 @@ TOSU_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "to
 TOSU_EXE = os.path.join(TOSU_DIR, "tosu.exe")
 
 def ensure_tosu():
-    """Launch tosu, kill any stale instances first."""
+    """Launch tosu if not already running."""
     if not os.path.exists(TOSU_EXE):
         print(f"  ERROR: {TOSU_EXE} not found!")
         return None
+
+    # Check if already running
+    try:
+        req = urllib.request.Request("http://localhost:24050/json")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            pass
+        print("  tosu: already running")
+        return None
+    except:
+        pass
 
     # Kill any existing tosu processes
     try:
@@ -118,10 +136,8 @@ def main():
     parser.add_argument('replay', nargs='?',
                         default=None,
                         help='Path to .osr replay file')
-    parser.add_argument('--r', type=float, default=0.85,
-                        help='Playfield height ratio (default: 0.85)')
-    parser.add_argument('--advance', type=int, default=175,
-                        help='Timing advance in ms (default: 175)')
+    parser.add_argument('--advance', type=int, default=0,
+                        help='Additional input timing advance in ms (default: 0)')
     parser.add_argument('--k1', default='Z',
                         help='K1 key (default: Z)')
     parser.add_argument('--k2', default='X',
@@ -133,17 +149,31 @@ def main():
                         help='Delay after trigger in normal mode (ms, default: 500)')
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Playback speed multiplier (e.g. 1.5 for DT, 0.75 for HT)')
+    parser.add_argument('--clock-sync', dest='clock_sync', action='store_true', default=True,
+                        help='Align replay to the accepted SPACE clock jump (default)')
+    parser.add_argument('--no-clock-sync', dest='clock_sync', action='store_false',
+                        help='Use the legacy local timer after SPACE')
+    parser.add_argument('--clock-reader', default=None,
+                        help='Path to LazerClockReader.exe or its .dll')
+    parser.add_argument('--clock-sync-timeout-ms', type=int, default=5000,
+                        help='Timeout for reader startup and SPACE acceptance (default: 5000)')
+    parser.add_argument('--clock-jump-threshold-ms', type=float, default=100.0,
+                        help='Minimum positive clock jump treated as accepted SPACE (default: 100)')
     parser.add_argument('--auto-tune', action='store_true',
                         help='Auto-tune timing via tosu hit error monitoring')
-    parser.add_argument('--tune-n', type=int, default=100,
+    parser.add_argument('--tune-n', type=int, default=30,
                         help='Number of hits to check for auto-tune (default: 100)')
     parser.add_argument('--tune-threshold', type=float, default=10.0,
-                        help='Mean error threshold in ms for auto-tune (default: 10)')
+                        help='Mean error threshold in ms for auto-tune stage 1 (default: 10)')
+    parser.add_argument('--tune-n2', type=int, default=150,
+                        help='Number of hits for stage 2 check (default: 150)')
+    parser.add_argument('--tune-threshold2', type=float, default=5.0,
+                        help='Mean error threshold in ms for stage 2 (default: 5)')
     parser.add_argument('--config', default=None,
                         help='JSON config file (overrides other args)')
-    parser.add_argument('--restart-delay', type=float, default=3.0,
+    parser.add_argument('--restart-delay', type=float, default=5.0,
                         help='Seconds to wait after auto-abort for fail screen (default: 3)')
-    parser.add_argument('--restart-space-delay', type=float, default=2.0,
+    parser.add_argument('--restart-space-delay', type=float, default=3.5,
                         help='Seconds to wait before SPACE in skip-mode restart (default: 2)')
     args = parser.parse_args()
 
@@ -167,12 +197,13 @@ def main():
     print("="*55)
     print("  osu!lazer Replay Bot")
     print(f"  Replay: {args.replay}")
-    print(f"  Keys: {args.k1}/{args.k2} | R={args.r} | Advance={args.advance}ms")
+    print(f"  Keys: {args.k1}/{args.k2} | Advance={args.advance}ms")
     print("="*55)
 
     hwnd,rect,title = find_osu()
     global osu_hwnd; osu_hwnd = hwnd
     if not hwnd: print("ERROR: osu!lazer not running!"); return
+    osu_pid = window_process_id(hwnd)
     print(f"\n  osu!lazer: \"{title}\"")
     s=ctypes.windll.user32.GetWindowLongW(hwnd,-16)
     if s&0x20000000:
@@ -180,7 +211,6 @@ def main():
     ctypes.windll.user32.SetForegroundWindow(hwnd)
     time.sleep(0.1)
     rect=wintypes.RECT(); ctypes.windll.user32.GetWindowRect(hwnd,byref(rect))
-    w,h=rect.right-rect.left, rect.bottom-rect.top
 
     ADVANCE_MS = args.advance if args.mode == 'skip' else 0
     DELAY_MS = args.delay if args.mode == 'normal' else 0
@@ -198,26 +228,31 @@ def main():
 
     print(f"  Mode: {args.mode} | {'Advance' if skip_pauses else 'Delay'}: "
           f"{ADVANCE_MS if skip_pauses else DELAY_MS}ms | Speed: {speed}x")
+    clock_sync_enabled = bool(args.clock_sync and skip_pauses)
+    if clock_sync_enabled:
+        print("  Clock sync: enabled (osu!lazer CurrentTime)")
     th=r.count_300+r.count_100+r.count_50+r.count_miss
     acc=100.0*(r.count_300*300+r.count_100*100+r.count_50*50)/(300*th) if th else 0
     print(f"  {r.username} | {r.score}pts | {r.max_combo}x | {acc:.2f}%")
     print(f"  {tms/1000:.1f}s replay ({skipped/1000:.1f}s pause skipped) | {len(frames)} frames")
 
     sw,sh=scr()
-    R=args.r; ph=h*R; sc=ph/384.0; pw=512.0*sc
-    ox=(w-pw)/2.0; oy=(h-ph)/2.0
-    print(f"  Window: {w}x{h} | Scale: {sc:.4f}")
+    playfield = FullscreenPlayfield.from_screen(sw, sh)
+    window_width = rect.right - rect.left
+    window_height = rect.bottom - rect.top
+    if (rect.left, rect.top, window_width, window_height) != (0, 0, sw, sh):
+        print("  WARNING: osu!lazer is not covering the primary screen; fullscreen is required")
+    print(f"  Screen: {sw}x{sh} | Playfield: {playfield.width:.1f}x{playfield.height:.1f} "
+          f"at ({playfield.left:.1f}, {playfield.top:.1f}) | Scale: {playfield.scale:.4f}")
 
     def map_osu(osu_x, osu_y):
-        px=ox+osu_x*sc; py=oy+osu_y*sc
-        sx=rect.left+px; sy=rect.top+py
-        ax=int(sx*65535.0/sw); ay=int(sy*65535.0/sh)
-        return max(0,min(65535,ax)), max(0,min(65535,ay))
+        return playfield.to_absolute(osu_x, osu_y)
 
     center_ax, center_ay = map_osu(256, 192)
 
     # --- tosu auto-tune setup ---
     tosu_errors = []
+    tosu_hp = [1.0]  # shared HP value for fail detection
     tosu_thread = None
     tosu_running = [False]
 
@@ -253,6 +288,9 @@ def main():
                         errs = hits.get('hitErrorArray') or []
                         if errs:
                             tosu_errors[:] = errs
+                        hp_data = gp.get('hp', {})
+                        if hp_data:
+                            tosu_hp[0] = hp_data.get('normal', 1.0)
                     except Exception:
                         continue
                 ws.close()
@@ -267,7 +305,24 @@ def main():
     # --- main loop (with auto-tune restart) ---
     run = 1
     skip_trigger_wait = False
+    _fail_direction = [1]  # +1=earlier (advance+), -1=later (advance-)
+    _fail_advance_base = [args.advance]
     while True:
+        clock_reader = None
+        sync_jump = None
+        sync_start_index = 0
+        if clock_sync_enabled:
+            try:
+                clock_reader = start_clock_reader(
+                    osu_pid,
+                    reader_path=args.clock_reader,
+                    ready_timeout_ms=args.clock_sync_timeout_ms,
+                    jump_threshold_ms=args.clock_jump_threshold_ms,
+                )
+                print("  Clock reader: ready")
+            except ClockSyncError as exc:
+                print(f"  WARNING: clock sync unavailable ({exc}); using legacy timer")
+
         tr_name = 'SPACE' if trigger_key == VK_SPACE else 'ENTER'
         if run == 1:
             print(f"\n{'='*55}")
@@ -277,14 +332,35 @@ def main():
             print(f"{'='*55}")
 
         if skip_trigger_wait:
-            # Auto-restarted: trigger already sent by bot
+            # Auto-restarted: send the trigger after the reader is ready.
             print(f"\n  [Run {run}] Auto-triggered")
             skip_trigger_wait = False
+            if trigger_key == VK_SPACE:
+                kkey(VK_SPACE, True); time.sleep(0.05); kkey(VK_SPACE, False)
+                print("  SPACE sent")
+                if clock_reader is not None:
+                    try:
+                        sync_jump = clock_reader.wait_for_jump(args.clock_sync_timeout_ms / 1000.0)
+                    except ClockSyncError as exc:
+                        print(f"  WARNING: SPACE clock jump not observed ({exc}); using legacy timer")
+                else:
+                    sync_jump = None
         else:
             print(f"\n  [Run {run}] Waiting for {tr_name}...")
             while not kdown(trigger_key):
-                if kdown(VK_F7): print("  Aborted."); tosu_running[0] = False; return
+                if kdown(VK_F7):
+                    print("  Aborted.")
+                    tosu_running[0] = False
+                    if clock_reader is not None:
+                        clock_reader.stop()
+                    return
                 time.sleep(0.005)
+
+            if trigger_key == VK_SPACE and clock_reader is not None:
+                try:
+                    sync_jump = clock_reader.wait_for_jump(args.clock_sync_timeout_ms / 1000.0)
+                except ClockSyncError as exc:
+                    print(f"  WARNING: SPACE clock jump not observed ({exc}); using legacy timer")
 
         # In normal mode, add delay after trigger
         if args.mode == 'normal':
@@ -295,19 +371,55 @@ def main():
         print(f"  [Run {run}] GO!")
 
         ks={k:False for k in ['k1','k2']}
-        cnt,tot=0,len(frames); t0=time.perf_counter(); et=0; lr=t0
+        timeline = ReplayTimeline.from_frames(frames)
+        if sync_jump is not None:
+            sync_start_index = timeline.first_frame_at_or_after(sync_jump.time_ms)
+            sync_start_index = min(sync_start_index, len(frames))
+            previous_mask = initial_key_mask(frames, sync_start_index)
+            if sync_start_index > 0:
+                previous_frame = frames[sync_start_index - 1]
+                mabs(*map_osu(previous_frame.x, previous_frame.y))
+            for bit,name,vk in [(KK1,'k1',k1_vk),(KK2,'k2',k2_vk)]:
+                if previous_mask & bit:
+                    kkey(vk, True)
+                    ks[name] = True
+            print(f"  [Run {run}] SPACE accepted at lazer {sync_jump.time_ms:.1f}ms; "
+                  f"starting frame {sync_start_index}/{len(frames)}")
+            cnt = sync_start_index
+        else:
+            cnt = 0
+        tot=len(frames); t0=time.perf_counter(); et=0; lr=t0
         skipped_ms=0
         auto_abort = False
         auto_abort_mean = 0.0
-        first_key_pressed = False
+        first_key_pressed = any(ks.values())
+        stage1_passed = False
+        stage2_checked = False
 
         try:
-            for frame in frames:
+            for frame_index, frame in enumerate(frames):
                 if kdown(VK_F7): print("\n  F7 ABORT"); break
 
-                dt = frame.time_delta / speed
+                if sync_jump is not None:
+                    if frame_index < sync_start_index:
+                        continue
+                    et = timeline.frame_times_ms[frame_index]
+                    target = (sync_jump.qpc_seconds +
+                              (et - sync_jump.time_ms) / 1000.0 / speed - advance_s)
+                    w = target - time.perf_counter()
+                    if w > 0.001:
+                        if w > 0.003:
+                            time.sleep(w - 0.0015)
+                        while time.perf_counter() < target:
+                            pass
 
-                if skip_pauses and dt > 1000 and not first_key_pressed:
+                    ax,ay = map_osu(frame.x, frame.y)
+                    mabs(ax, ay)
+                    dt = 0
+                else:
+                    dt = frame.time_delta / speed
+
+                if sync_jump is None and skip_pauses and dt > 1000 and not first_key_pressed:
                     # SKIP long pauses entirely - don't wait
                     skipped_ms += dt
                     et += dt
@@ -325,8 +437,9 @@ def main():
                             while time.perf_counter() < target:
                                 pass
 
-                    ax,ay = map_osu(frame.x, frame.y)
-                    mabs(ax, ay)
+                    if sync_jump is None:
+                        ax,ay = map_osu(frame.x, frame.y)
+                        mabs(ax, ay)
 
                 # Keyboard only via PostMessage (bypasses raw input)
                 k = frame.keys
@@ -339,15 +452,40 @@ def main():
                         ks[name] = d
                 cnt += 1
 
-                # Auto-tune check
-                if args.auto_tune and len(tosu_errors) >= args.tune_n:
+                # Fail detection via HP drop
+                if args.auto_tune and tosu_hp[0] <= 0.01 and et > 5000:
+                    auto_abort = True
+                    auto_abort_mean = 0
+                    print(f"\n  [Auto-tune] FAIL detected (HP=0). Restarting...")
+                    break
+
+                # Auto-tune stage 1: coarse check
+                if args.auto_tune and not stage1_passed and len(tosu_errors) >= args.tune_n:
                     first_n = tosu_errors[:args.tune_n]
                     mean_err = sum(first_n) / len(first_n)
                     if abs(mean_err) > args.tune_threshold:
                         auto_abort = True
                         auto_abort_mean = mean_err
-                        print(f"\n  [Auto-tune] {len(first_n)} hits, mean={mean_err:+.1f}ms > {args.tune_threshold}ms")
+                        print(f"\n  [Auto-tune S1] {len(first_n)} hits, mean={mean_err:+.1f}ms > {args.tune_threshold}ms")
                         break
+                    else:
+                        stage1_passed = True
+                        print(f"\n  [Auto-tune S1] {len(first_n)} hits, mean={mean_err:+.1f}ms OK (<= {args.tune_threshold}ms)")
+                        print(f"  Continuing for stage 2 check at {args.tune_n2} hits...")
+
+                # Auto-tune stage 2: fine check (once)
+                if args.auto_tune and stage1_passed and not stage2_checked and len(tosu_errors) >= args.tune_n2:
+                    stage2_checked = True
+                    all_n = tosu_errors[:args.tune_n2]
+                    mean_err = sum(all_n) / len(all_n)
+                    if abs(mean_err) > args.tune_threshold2:
+                        auto_abort = True
+                        auto_abort_mean = mean_err
+                        print(f"\n  [Auto-tune S2] {len(all_n)} hits, mean={mean_err:+.1f}ms > {args.tune_threshold2}ms")
+                        break
+                    else:
+                        print(f"\n  [Auto-tune S2] {len(all_n)} hits, mean={mean_err:+.1f}ms OK (<= {args.tune_threshold2}ms)")
+                        print(f"  Timing calibrated. Continuing to completion.")
 
                 n = time.perf_counter()
                 if n - lr > 10:
@@ -364,22 +502,56 @@ def main():
                 if d:
                     if k=='k1': kkey(k1_vk,False)
                     elif k=='k2': kkey(k2_vk,False)
+            if clock_reader is not None:
+                clock_reader.stop()
 
         wt = time.perf_counter()-t0
 
         # --- auto-tune restart logic ---
         if auto_abort:
-            print(f"  [Auto-tune] Adjusting: mean_error = {auto_abort_mean:+.1f}ms")
-            if args.mode == 'skip':
-                args.advance += int(auto_abort_mean)
-                args.advance = max(0, args.advance)
-                advance_s = args.advance / 1000.0
+            if auto_abort_mean == 0 and len(tosu_errors) == 0:
+                # Fail with 0 hits: systematic timing search
+                direction = _fail_direction[0]
+                if direction > 0:
+                    args.advance += 200  # positive = earlier
+                    if args.advance >= _fail_advance_base[0] + 2000:
+                        _fail_direction[0] = -1
+                        args.advance = _fail_advance_base[0] - 200
+                        print(f"  [Fail] Trying later offsets...")
+                elif direction == 0:
+                    _fail_direction[0] = 1
+                    args.advance += 200
+                else:
+                    args.advance -= 200  # negative = later
+                    if args.advance <= _fail_advance_base[0] - 2000:
+                        print(f"  [Fail] All offsets exhausted (-2000..+2000). Stopping.")
+                        tosu_running[0] = False
+                        sys.exit(1)
+
+                adj = args.advance - _fail_advance_base[0]
+                adj_label = "earlier" if adj > 0 else "later"
+                print(f"  [Fail] advance={args.advance}ms ({adj:+d}ms {adj_label})")
+            elif auto_abort_mean == 0:
+                # Fail with hits: use available hit errors
+                if len(tosu_errors) > 0:
+                    mean_err = sum(tosu_errors) / len(tosu_errors)
+                    adj = int(mean_err)
+                    args.advance += adj
+                    print(f"  [Fail] {len(tosu_errors)} hits, mean={mean_err:+.1f}ms -> advance={args.advance}ms")
+                    _fail_direction[0] = 0
+                    _fail_advance_base[0] = args.advance
+                else:
+                    print(f"  [Fail] no hit data, retrying same params")
             else:
-                args.delay += int(auto_abort_mean)
-                args.delay = max(0, args.delay)
-                delay_s = args.delay / 1000.0
-            print(f"  -> {'advance' if args.mode == 'skip' else 'delay'} = "
-                  f"{args.advance if args.mode == 'skip' else args.delay}ms")
+                # Normal timing adjustment from hit errors
+                adj = int(auto_abort_mean)
+                print(f"  [Auto-tune] Adjusting: mean_error = {auto_abort_mean:+.1f}ms")
+                args.advance += adj
+                # Reset fail search on successful S1
+                _fail_direction[0] = 0
+                _fail_advance_base[0] = args.advance
+            advance_s = args.advance / 1000.0
+            print(f"  -> advance = {args.advance}ms")
 
             # Fully automated restart: wait -> ESC -> ENTER -> SPACE
             restart_secs = args.restart_delay
@@ -399,8 +571,7 @@ def main():
                 space_wait = args.restart_space_delay
                 print(f"  Waiting {space_wait}s then SPACE...")
                 time.sleep(space_wait)
-                kkey(VK_SPACE, True); time.sleep(0.05); kkey(VK_SPACE, False)
-                print(f"  SPACE pressed!")
+                print("  SPACE will be sent at the next run boundary")
             # For normal mode, ENTER IS the trigger so no extra step needed
 
             run += 1

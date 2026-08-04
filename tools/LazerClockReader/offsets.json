@@ -1,0 +1,11 @@
+{
+  "osu_version": "2026.726.0",
+  "scan_pattern": "01 01 00 00 00 00 80 44 00 00 40 44",
+  "game_base_vtable": 7834037125120,
+  "game_base_from_anchor_deltas": [36, 40, 44, 32, 48, 28, 52],
+  "external_link_opener_api": 536,
+  "api_game": 784,
+  "beatmap_clock": 1232,
+  "framed_beatmap_clock_final_source": 528,
+  "framed_clock_current_time": 48
+}

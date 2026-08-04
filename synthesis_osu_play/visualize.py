@@ -21,6 +21,7 @@ from .synthesis import (
     synthesize_replays,
     to_absolute_frames,
     validate_compatible,
+    effective_weights,
 )
 
 
@@ -591,6 +592,7 @@ def draw_tracks(
     first_pos = interpolate_position(tracks.first, time_ms)
     second_pos = interpolate_position(tracks.second, time_ms)
     synth_pos = interpolate_position(tracks.synthesized, time_ms)
+    effective_first_weight, effective_second_weight = effective_weights(time_ms, first_weight, second_weight)
     cv2.line(canvas, layout.point(*first_pos), layout.point(*second_pos), (62, 72, 82), 1, cv2.LINE_AA)
     draw_trail(canvas, layout, tracks.first, time_ms, trail_ms, first_color, cv2)
     draw_trail(canvas, layout, tracks.second, time_ms, trail_ms, second_color, cv2)
@@ -599,7 +601,7 @@ def draw_tracks(
     draw_cursor(canvas, layout, second_pos, second_color, "2", cv2)
     draw_cursor(canvas, layout, synth_pos, synth_color, "S", cv2, radius=8)
 
-    expected = weighted_position(first_pos, second_pos, first_weight, second_weight)
+    expected = weighted_position(first_pos, second_pos, effective_first_weight, effective_second_weight)
     expected_point = layout.point(*expected)
     cv2.drawMarker(canvas, expected_point, (80, 255, 255), cv2.MARKER_CROSS, 18, 1, cv2.LINE_AA)
 
@@ -661,14 +663,15 @@ def draw_panel(
     first_pos = interpolate_position(tracks.first, time_ms)
     second_pos = interpolate_position(tracks.second, time_ms)
     synth_pos = interpolate_position(tracks.synthesized, time_ms)
-    expected = weighted_position(first_pos, second_pos, first_weight, second_weight)
+    effective_first_weight, effective_second_weight = effective_weights(time_ms, first_weight, second_weight)
+    expected = weighted_position(first_pos, second_pos, effective_first_weight, effective_second_weight)
     distance = ((first_pos[0] - second_pos[0]) ** 2 + (first_pos[1] - second_pos[1]) ** 2) ** 0.5
     residual = ((expected[0] - synth_pos[0]) ** 2 + (expected[1] - synth_pos[1]) ** 2) ** 0.5
 
     lines = [
         "synthesis debug",
         f"time {time_ms / 1000:.3f}s",
-        f"weights {first_weight:g}:{second_weight:g}",
+        f"weights {effective_first_weight:.2f}:{effective_second_weight:.2f}",
         f"output mods {mods}",
         f"fps {fps:g} speed {speed:g}x",
         f"source distance {distance:.2f}px",

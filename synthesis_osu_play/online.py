@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -32,6 +34,52 @@ MAX_SCORE_REQUEST_LIMIT = 100
 DEFAULT_SCORE_REQUEST_LIMIT = 50
 DEFAULT_BATCH_OUTPUT_DIR = Path(r"D:\osu-lazer\exports")
 DEFAULT_BATCH_WORK_DIR = Path("artifacts") / "batch-dt"
+API_REQUEST_TIMEOUT_S = 30
+BATCH_SUPPORTED_SOURCE_MODS = frozenset(
+    {
+        "EZ",
+        "NF",
+        "HT",
+        "DC",
+        "HR",
+        "SD",
+        "PF",
+        "DT",
+        "NC",
+        "HD",
+        "TC",
+        "FL",
+        "BL",
+        "ST",
+        "AC",
+        "CL",
+    }
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+def api_ssl_context() -> ssl.SSLContext:
+    """Create the TLS context used for osu! API connections.
+
+    Some osu!/Cloudflare connections close without sending TLS close-notify.
+    OpenSSL 3 treats that as a protocol error unless this compatibility option
+    is enabled. Certificate and hostname verification remain enabled.
+    """
+    context = ssl.create_default_context()
+    ignore_unexpected_eof = getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+    if ignore_unexpected_eof:
+        context.options |= ignore_unexpected_eof
+    return context
+
+
+_API_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=api_ssl_context()),
+)
+
+
+def api_urlopen(request: urllib.request.Request) -> HttpResponse:
+    return _API_OPENER.open(request, timeout=API_REQUEST_TIMEOUT_S)
 
 
 class OnlineSynthesisError(ValueError):
@@ -92,6 +140,7 @@ class OnlineSynthesisReport:
     synthesis_report: SynthesisReport
     lazer_json_path: Path | None = None
     debug_video_path: Path | None = None
+    work_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +194,7 @@ class OsuApiClient:
         self.api_url = api_url.rstrip("/")
         self.api_version = api_version if api_version is not None else int(datetime.now().strftime("%Y%m%d"))
         self.request_delay_s = request_delay_s
-        self.urlopen = urlopen or urllib.request.urlopen
+        self.urlopen = urlopen or api_urlopen
         self._last_request_at = 0.0
 
     def get_beatmap(self, beatmap_id: int) -> dict[str, Any]:
@@ -211,13 +260,19 @@ class OsuApiClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise OnlineSynthesisError(f"invalid JSON response for {target}") from exc
 
-    def get_bytes(self, target: str, query: dict[str, object] | None = None) -> bytes:
+    def get_bytes(self, target: str, query: dict[str, object] | None = None, *, _retries: int = 3) -> bytes:
         request = urllib.request.Request(self.url(target, query), headers=self.headers)
         self.wait_for_rate_limit()
         try:
             with self.urlopen(request) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
+            if exc.code == 429 and _retries > 0:
+                wait = 5.0 * (4 - _retries)
+                LOGGER.warning("rate limited, retrying in %.0fs...", wait)
+                time.sleep(wait)
+                self._last_request_at = time.monotonic()
+                return self.get_bytes(target, query, _retries=_retries - 1)
             message = exc.reason
             try:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -227,7 +282,29 @@ class OsuApiClient:
                 message = f"{message}: {body}"
             raise OnlineSynthesisError(f"osu! API request failed ({exc.code}) for {target}: {message}") from exc
         except urllib.error.URLError as exc:
+            if _retries > 0 and is_transient_network_error(exc.reason):
+                wait = float(4 - _retries)
+                LOGGER.warning(
+                    "transient osu! API connection error for %s; retrying in %.0fs...",
+                    target,
+                    wait,
+                )
+                time.sleep(wait)
+                self._last_request_at = time.monotonic()
+                return self.get_bytes(target, query, _retries=_retries - 1)
             raise OnlineSynthesisError(f"osu! API request failed for {target}: {exc.reason}") from exc
+        except (ssl.SSLError, ConnectionError, TimeoutError) as exc:
+            if _retries > 0:
+                wait = float(4 - _retries)
+                LOGGER.warning(
+                    "transient osu! API connection error for %s; retrying in %.0fs...",
+                    target,
+                    wait,
+                )
+                time.sleep(wait)
+                self._last_request_at = time.monotonic()
+                return self.get_bytes(target, query, _retries=_retries - 1)
+            raise OnlineSynthesisError(f"osu! API request failed for {target}: {exc}") from exc
 
     def wait_for_rate_limit(self) -> None:
         if self.request_delay_s <= 0:
@@ -289,6 +366,10 @@ def download_and_synthesize(
     debug_video_speed: float = 1.0,
     debug_video_size: tuple[int, int] = (1280, 720),
     client: OsuApiClient | None = None,
+    spinner_library_path: str | None = None,
+    sequential_match: bool = True,
+    dt_mode: bool = False,
+    spinner_mode: str = "all",
 ) -> OnlineSynthesisReport:
     validate_rank(first_rank)
     validate_rank(second_rank)
@@ -347,6 +428,10 @@ def download_and_synthesize(
         second_weight=second_weight,
         recompute_score_metadata=recompute_score_metadata,
         output_mods=output_mods,
+        spinner_library_path=spinner_library_path,
+        sequential_match=sequential_match,
+        dt_mode=dt_mode,
+        spinner_mode=spinner_mode,
     )
     result.replay.write_path(output_path)
 
@@ -393,6 +478,7 @@ def download_and_synthesize(
         synthesis_report=result.report,
         lazer_json_path=lazer_json_output,
         debug_video_path=debug_video_output,
+        work_dir=work_dir,
     )
 
 
@@ -403,7 +489,7 @@ def batch_synthesize_dt(
     work_dir: str | Path = DEFAULT_BATCH_WORK_DIR,
     min_age_days: int = 3,
     min_star: float = 4.5,
-    max_star: float = 5.5,
+    max_star: float = 5.0,
     player_name: str | None = None,
     scope: str = "global",
     ruleset: str = "osu",
@@ -414,8 +500,12 @@ def batch_synthesize_dt(
     api_version: int | None = None,
     leaderboard_limit: int = MAX_SCORE_REQUEST_LIMIT,
     search_pages_limit: int = 25,
-    request_delay_s: float = 1.0,
+    request_delay_s: float = 2.0,
     random_seed: int | None = None,
+    min_skip_time_ms: int = 4000,
+    spinner_library_path: str | Path | None = None,
+    spinner_mode: str = "all",
+    dt_mode: bool = True,
     client: OsuApiClient | None = None,
 ) -> BatchSynthesisReport:
     if count < 1:
@@ -451,6 +541,16 @@ def batch_synthesize_dt(
     cursor_string: str | None = None
     pages = 0
 
+    if min_skip_time_ms < 0:
+        raise OnlineSynthesisError("minimum skip time must be non-negative")
+
+    LOGGER.info(
+        "Searching ranked beatmaps (>= %sd old, %s-%s*), skip>= %sms...",
+        min_age_days,
+        min_star,
+        max_star,
+        min_skip_time_ms,
+    )
     while len(items) < count and pages < search_pages_limit:
         pages += 1
         payload = client.search_beatmapsets(
@@ -464,6 +564,7 @@ def batch_synthesize_dt(
             encoding="utf-8",
         )
         candidates = search_candidates_from_payload(payload, min_star=min_star, max_star=max_star)
+        LOGGER.info("page %s: %s candidates in star range, %s/%s collected", pages, len(candidates), len(items), count)
         for candidate in candidates:
             if len(items) >= count:
                 break
@@ -472,6 +573,10 @@ def batch_synthesize_dt(
             seen_beatmap_ids.add(candidate.beatmap_id)
             if candidate.ranked_date.timestamp() > cutoff:
                 continue
+            candidate_label = (
+                f"[{len(items)+1}/{count}] beatmap {candidate.beatmap_id}: "
+                f"{candidate.title[:40]} [{candidate.version[:20]}] ({candidate.difficulty_rating:.2f}*)"
+            )
             try:
                 item = try_synthesize_batch_candidate(
                     client,
@@ -485,8 +590,17 @@ def batch_synthesize_dt(
                     no_video=no_video,
                     leaderboard_limit=leaderboard_limit,
                     rng=rng,
+                    min_skip_time_ms=min_skip_time_ms,
+                    spinner_library_path=spinner_library_path,
+                    spinner_mode=spinner_mode,
+                    dt_mode=dt_mode,
                 )
+                if item is not None:
+                    LOGGER.info("%s ... OK (%s/%s)", candidate_label, item.first_score.username, item.second_score.username)
+                else:
+                    LOGGER.info("%s ... SKIP (intro too short)", candidate_label)
             except (OnlineSynthesisError, OSError, ValueError) as exc:
+                LOGGER.info("%s ... FAIL (%s)", candidate_label, exc)
                 write_batch_skip_reason(work_dir, candidate, str(exc))
                 continue
             if item is not None:
@@ -524,6 +638,10 @@ def try_synthesize_batch_candidate(
     no_video: bool,
     leaderboard_limit: int,
     rng: random.Random,
+    min_skip_time_ms: int = 4000,
+    spinner_library_path: str | Path | None = None,
+    spinner_mode: str = "all",
+    dt_mode: bool = True,
 ) -> BatchSynthesisItem | None:
     beatmap_dir = work_dir / str(candidate.beatmap_id)
     beatmap_dir.mkdir(parents=True, exist_ok=True)
@@ -556,12 +674,18 @@ def try_synthesize_batch_candidate(
     first = OsrReplay.read_path(first_replay_path)
     second = OsrReplay.read_path(second_replay_path)
     beatmap = Beatmap.read_path(beatmap_path)
+    if beatmap.first_hit_object_time_ms < min_skip_time_ms:
+        return None  # skip: intro too short for skip
     result = synthesize_replays(
         first,
         second,
         beatmap=beatmap,
         player_name=player_name,
         output_mods=MOD_DOUBLE_TIME,
+        allow_source_mod_mismatch=True,
+        spinner_library_path=str(spinner_library_path) if spinner_library_path is not None else None,
+        spinner_mode=spinner_mode,
+        dt_mode=dt_mode,
     )
     output_path = output_dir / f"{candidate.beatmap_id}.osr"
     result.replay.write_path(output_path)
@@ -659,23 +783,11 @@ def choose_batch_scores(
     scores: list[LeaderboardScore],
     rng: random.Random,
 ) -> tuple[LeaderboardScore, LeaderboardScore, str] | None:
-    downloadable = [score for score in scores if score.has_replay and score_mods_can_normalize_to_dt(score)]
-    if len(downloadable) < 2:
+    eligible = [score for score in scores if score.has_replay and score_mods_supported_for_batch(score)]
+    if len(eligible) < 2:
         return None
-    dt_no_hr = [
-        score
-        for score in downloadable
-        if score_has_standard_dt(score) and not score_has_mod(score, "HR")
-    ]
-    if len(dt_no_hr) >= 2:
-        first, second = rng.sample(dt_no_hr, 2)
-        return first, second, "dt_no_hr"
-    no_hr = [score for score in downloadable if not score_has_mod(score, "HR")]
-    if len(no_hr) >= 2:
-        first, second = rng.sample(no_hr, 2)
-        return first, second, "no_hr"
-    first, second = rng.sample(downloadable, 2)
-    return first, second, "any"
+    first, second = rng.sample(eligible, 2)
+    return first, second, "supported_random"
 
 
 def leaderboard_score_at_index(rank: int, score: dict[str, Any]) -> LeaderboardScore:
@@ -693,43 +805,12 @@ def leaderboard_score_at_index(rank: int, score: dict[str, Any]) -> LeaderboardS
     )
 
 
-def score_has_standard_dt(score: LeaderboardScore) -> bool:
-    if not any(mod.upper() in {"DT", "NC"} for mod in score.mods):
-        return False
-    raw_mods = score.raw.get("mods")
-    if not isinstance(raw_mods, list):
+def score_mods_supported_for_batch(score: LeaderboardScore) -> bool:
+    """Return whether a leaderboard score uses only approved source mods."""
+    mods = {mod.strip().upper() for mod in score.mods if mod.strip()}
+    if not mods or mods == {"NM"}:
         return True
-    for raw_mod in raw_mods:
-        if isinstance(raw_mod, str):
-            if raw_mod.upper() in {"DT", "NC"}:
-                return True
-            continue
-        if not isinstance(raw_mod, dict):
-            continue
-        acronym = raw_mod.get("acronym")
-        if not isinstance(acronym, str) or acronym.upper() not in {"DT", "NC"}:
-            continue
-        settings = raw_mod.get("settings")
-        if not isinstance(settings, dict):
-            return True
-        speed_change = settings.get("speed_change")
-        if speed_change is None:
-            return True
-        try:
-            return float(speed_change) == 1.5
-        except (TypeError, ValueError):
-            return False
-    return False
-
-
-def score_has_mod(score: LeaderboardScore, acronym: str) -> bool:
-    acronym = acronym.upper()
-    return any(mod.upper() == acronym for mod in score.mods)
-
-
-def score_mods_can_normalize_to_dt(score: LeaderboardScore) -> bool:
-    allowed = {"HD", "HR", "DT", "NC", "HT", "CL"}
-    return all(mod.upper() in allowed for mod in score.mods)
+    return mods <= BATCH_SUPPORTED_SOURCE_MODS
 
 
 def cursor_string_from_payload(payload: dict[str, Any]) -> str | None:
@@ -808,6 +889,10 @@ def validate_rank(rank: int) -> None:
         raise OnlineSynthesisError(f"rank must be positive: {rank}")
 
 
+def is_transient_network_error(reason: object) -> bool:
+    return isinstance(reason, (ssl.SSLError, ConnectionError, TimeoutError))
+
+
 def read_lazer_token(
     *,
     lazer_storage: str | Path | None = None,
@@ -848,7 +933,7 @@ def refresh_lazer_token(
     if not token.refresh_token:
         raise OnlineSynthesisError("osu!lazer API token is expired and no refresh token is available")
 
-    urlopen = urlopen or urllib.request.urlopen
+    urlopen = urlopen or api_urlopen
     payload = urllib.parse.urlencode(
         {
             "grant_type": "refresh_token",
@@ -1087,28 +1172,26 @@ def import_batch_beatmaps(report: BatchSynthesisReport, *, lazer_path: str | Pat
         )
 
     lazer_executable = resolve_lazer_executable(lazer_path)
-    try:
-        process = subprocess.Popen(
-            [str(lazer_executable), *map(str, archive_paths)],
-            cwd=str(lazer_executable.parent),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as exc:
-        raise OnlineSynthesisError(f"failed to launch osu!lazer for import: {lazer_executable}") from exc
-
-    try:
-        process.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        return archive_paths
-
-    if process.returncode not in (0, None):
-        raise OnlineSynthesisError(
-            f"osu!lazer exited with code {process.returncode} while importing beatmaps"
-        )
-
-    return archive_paths
+    imported: list[Path] = []
+    for i, path in enumerate(archive_paths):
+        try:
+            proc = subprocess.Popen(
+                [str(lazer_executable), str(path)],
+                cwd=str(lazer_executable.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            proc.wait(timeout=30)
+            imported.append(path)
+            if i % 3 == 2:
+                time.sleep(1.0)
+        except OSError as exc:
+            LOGGER.warning("import failed for %s: %s", path, exc)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait()
+    return tuple(imported)
 
 
 def extract_beatmap_file(

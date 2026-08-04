@@ -11,6 +11,19 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "synthesis-osu-play contributors" }]
 
+[project.optional-dependencies]
+video = [
+    "numpy",
+    "opencv-python",
+]
+playback = [
+    "osrparse",
+    "websocket-client",
+]
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 synthesis-osu-play = "synthesis_osu_play.cli:main"
 

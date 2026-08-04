@@ -10,17 +10,22 @@ from synthesis_osu_play.mods import (
     MOD_HALF_TIME,
     MOD_HARD_ROCK,
     MOD_HIDDEN,
+    MOD_NO_FAIL,
 )
 from synthesis_osu_play.osr import OsrReplay, ReplayFrame, decode_lazer_replay_metadata, encode_lazer_replay_metadata
+import synthesis_osu_play.spinner_replace as spinner_module
 import synthesis_osu_play.synthesis as synthesis_module
 from synthesis_osu_play.synthesis import (
     KeyInterval,
     LEGACY_X_KEY,
     LEGACY_Z_KEY,
     SynthesisError,
+    assign_natural_keys,
     ensure_no_triple_overlap,
+    effective_weights,
     extract_key_intervals,
     modded_hit_objects_for_matching,
+    randomized_primary_key_repeat_threshold_ms,
     synthesize_replays,
     to_absolute_frames,
 )
@@ -60,6 +65,47 @@ def make_replay(
     )
 
 
+@pytest.mark.parametrize(
+    ("starts", "expected_z", "expected_x"),
+    (
+        ((0, 600, 700), (0, 600), (700,)),
+        ((0, 100, 200), (0, 200), (100,)),
+        ((0, 100, 700, 800), (0, 700), (100, 800)),
+        ((0, 500, 600), (0, 600), (500,)),
+    ),
+)
+def test_assign_natural_keys_prefers_primary_key_with_short_gap_switches(
+    starts: tuple[int, ...],
+    expected_z: tuple[int, ...],
+    expected_x: tuple[int, ...],
+) -> None:
+    intervals = [KeyInterval(start, start + 10) for start in starts]
+
+    assigned = assign_natural_keys(intervals)
+
+    assert [interval.start_ms for interval in assigned[LEGACY_Z_KEY]] == list(expected_z)
+    assert [interval.start_ms for interval in assigned[LEGACY_X_KEY]] == list(expected_x)
+
+
+@pytest.mark.parametrize("jitter_ms", (-100, 0, 100))
+def test_randomized_primary_key_repeat_threshold_uses_configured_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+    jitter_ms: int,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_uniform(lower: int, upper: int) -> int:
+        calls.append((lower, upper))
+        return jitter_ms
+
+    monkeypatch.setattr(synthesis_module.random, "uniform", fake_uniform)
+
+    threshold = randomized_primary_key_repeat_threshold_ms()
+
+    assert threshold == 500 + jitter_ms
+    assert calls == [(-100, 100)]
+
+
 def test_synthesize_averages_positions_and_key_intervals() -> None:
     first = make_replay(
         (
@@ -90,8 +136,9 @@ def test_synthesize_averages_positions_and_key_intervals() -> None:
         (10, 0),
         (10, 0),
     ]
-    assert result.replay.frames[2].x == 15.0
-    assert result.replay.frames[2].y == 5.0
+    _, second_weight = effective_weights(15, 1.0, 1.0)
+    assert result.replay.frames[2].x == pytest.approx(15.0)
+    assert result.replay.frames[2].y == pytest.approx(10.0 * second_weight)
 
 
 def test_synthesize_rejects_unsupported_mod_mismatch() -> None:
@@ -186,6 +233,27 @@ def test_synthesize_flips_hard_rock_replay_to_normal_playfield() -> None:
     result = synthesize_replays(first, second)
 
     assert result.replay.mods == 0
+    assert result.replay.frames[0].y == pytest.approx(284.0)
+
+
+def test_synthesize_can_project_source_mods_to_explicit_batch_output() -> None:
+    first = make_replay(
+        (ReplayFrame(0, 100.0, 100.0, 0),),
+        mods=MOD_HARD_ROCK | MOD_NO_FAIL,
+    )
+    second = make_replay(
+        (ReplayFrame(0, 100.0, 284.0, 0),),
+        mods=MOD_HALF_TIME,
+    )
+
+    result = synthesize_replays(
+        first,
+        second,
+        output_mods=MOD_DOUBLE_TIME,
+        allow_source_mod_mismatch=True,
+    )
+
+    assert result.replay.mods == MOD_DOUBLE_TIME
     assert result.replay.frames[0].y == pytest.approx(284.0)
 
 
@@ -401,11 +469,23 @@ def test_object_aware_synthesis_fills_miss_chain_from_nearby_extra_clicks() -> N
     assert result.report.matched_object_count == 3
     assert result.report.dropped_object_count == 0
     absolute = to_absolute_frames(result.replay.frames)
-    assert extract_key_intervals(absolute, LEGACY_Z_KEY) == [
-        KeyInterval(1010, 1060),
-        KeyInterval(2975, 3025),
-    ]
-    assert extract_key_intervals(absolute, LEGACY_X_KEY) == [KeyInterval(1985, 2035)]
+    first_weight, second_weight = effective_weights(1010, 1.0, 1.0)
+    first_z = extract_key_intervals(absolute, LEGACY_Z_KEY)
+    assert first_z[0] == KeyInterval(
+        round((1000 * first_weight) + (1020 * second_weight)),
+        round((1050 * first_weight) + (1070 * second_weight)),
+    )
+    object_2_first_weight, object_2_second_weight = effective_weights(2000, 1.0, 1.0)
+    object_3_first_weight, object_3_second_weight = effective_weights(3000, 1.0, 1.0)
+    assert first_z[1] == KeyInterval(
+        round((1950 * object_2_first_weight) + (2020 * object_2_second_weight)),
+        round((2000 * object_2_first_weight) + (2070 * object_2_second_weight)),
+    )
+    assert first_z[2] == KeyInterval(
+        round((2950 * object_3_first_weight) + (3000 * object_3_second_weight)),
+        round((3000 * object_3_first_weight) + (3050 * object_3_second_weight)),
+    )
+    assert extract_key_intervals(absolute, LEGACY_X_KEY) == []
 
 
 def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,6 +497,7 @@ def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyP
             return sigma / 2
 
     monkeypatch.setattr(synthesis_module, "Random", DeterministicRandom)
+    monkeypatch.setattr(synthesis_module.random, "uniform", lambda _lower, _upper: 0)
 
     beatmap = Beatmap(
         md5="same-map",
@@ -451,11 +532,50 @@ def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyP
     result = synthesize_replays(first, second, beatmap=beatmap)
     absolute = to_absolute_frames(result.replay.frames)
 
-    assert extract_key_intervals(absolute, LEGACY_Z_KEY) == [
-        KeyInterval(1005, 1060),
-        KeyInterval(2200, 2250),
-    ]
+    first_weight, second_weight = effective_weights(1000, 1.0, 1.0)
+    assert extract_key_intervals(absolute, LEGACY_Z_KEY)[0] == KeyInterval(
+        round((1000 * first_weight) + (1010 * second_weight)),
+        round((1050 * first_weight) + (1070 * second_weight)),
+    )
+    assert extract_key_intervals(absolute, LEGACY_Z_KEY)[1] == KeyInterval(2200, 2250)
     assert extract_key_intervals(absolute, LEGACY_X_KEY) == [KeyInterval(1446, 2075)]
+
+
+def test_synthesis_uses_bundled_spinner_library_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_replace_spinner_segments(*args, **kwargs):
+        captured["library_path"] = kwargs["library_path"]
+        captured["spinner_mode"] = kwargs["spinner_mode"]
+        return args[0], []
+
+    monkeypatch.setattr(spinner_module, "replace_spinner_segments", fake_replace_spinner_segments)
+    beatmap = Beatmap(
+        md5="same-map",
+        audio_lead_in_ms=0,
+        circle_size=5.0,
+        overall_difficulty=5.0,
+        hit_objects=(HitObject(0, 256.0, 192.0, 1000, 8, end_time_ms=1800),),
+    )
+    first = make_replay(
+        (
+            ReplayFrame(0, 256.0, 192.0, 0),
+            ReplayFrame(1800, 256.0, 192.0, 0),
+        )
+    )
+    second = make_replay(
+        (
+            ReplayFrame(0, 256.0, 192.0, 0),
+            ReplayFrame(1800, 256.0, 192.0, 0),
+        )
+    )
+
+    synthesize_replays(first, second, beatmap=beatmap)
+
+    assert captured == {
+        "library_path": str(spinner_module.DEFAULT_SPINNER_LIBRARY_PATH),
+        "spinner_mode": "all",
+    }
 
 
 def test_object_aware_synthesis_drops_object_missing_in_either_replay() -> None:
@@ -541,8 +661,14 @@ def test_skip_intro_position_uses_third_anchor_before_skip() -> None:
     result = synthesize_replays(first, second, first_skip_ms=1000, second_skip_ms=1500, intro_end_ms=2000)
 
     assert result.report.skip_press_ms == 1000
-    assert result.replay.frames[1].x == pytest.approx(66.666666, abs=0.000001)
-    assert result.replay.frames[1].y == pytest.approx(33.333333, abs=0.000001)
+    first_weight, second_weight = effective_weights(1000, 1.0, 1.0)
+    first_absolute = synthesis_module.to_absolute_frames(first.frames)
+    second_absolute = synthesis_module.to_absolute_frames(second.frames)
+    anchor_x, anchor_y = synthesis_module.average_position_at_time(first_absolute, second_absolute, 2000)
+    expected_x = synthesis_module.weighted_average_three(10.0, 40.0, anchor_x, first_weight, second_weight, 1.0)
+    expected_y = synthesis_module.weighted_average_three(0.0, 0.0, anchor_y, first_weight, second_weight, 1.0)
+    assert result.replay.frames[1].x == pytest.approx(expected_x)
+    assert result.replay.frames[1].y == pytest.approx(expected_y)
 
 
 def test_skip_requires_intro_end_without_beatmap() -> None:
@@ -645,8 +771,8 @@ def test_beatmap_synthesis_can_recompute_score_metadata_locally() -> None:
 
     result = synthesize_replays(first, second, beatmap=beatmap, recompute_score_metadata=True)
 
-    assert result.replay.count_300 == 0
-    assert result.replay.count_100 == 1
+    assert result.replay.count_300 == 1
+    assert result.replay.count_100 == 0
     assert result.replay.count_miss == 1
     assert result.replay.max_combo == 1
     assert not result.replay.perfect
