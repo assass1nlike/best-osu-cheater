@@ -29,6 +29,7 @@ class ClockJump:
 class ClockSample:
     time_ms: float
     qpc_seconds: float
+    source_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class LazerClockReader:
         self._process: subprocess.Popen[str] | None = None
         self._events: queue.Queue[dict[str, object]] = queue.Queue()
         self._reader_thread: threading.Thread | None = None
+        self._last_sample: ClockSample | None = None
 
     @property
     def started(self) -> bool:
@@ -231,10 +233,144 @@ class LazerClockReader:
             if 100.0 <= rate_ms_per_s <= 3000.0:
                 return recent[-1]
 
+    def wait_for_gameplay_start(
+        self,
+        timeout_s: float,
+        *,
+        max_time_ms: float | None = None,
+        boundary_samples: int = 2,
+        boundary_epsilon_ms: float = 1.0,
+        stable_boundary_duration_ms: float = 100.0,
+        running_samples: int = 3,
+        min_delta_ms: float = 5.0,
+        stable_boundary_max_ms: float | None = 1000.0,
+        allow_running_without_boundary: bool = True,
+    ) -> ClockSample:
+        """Return the earliest reliable moving gameplay clock sample.
+
+        The global lazer beatmap clock is also used for song-select previews.
+        A moving clock alone therefore cannot identify the gameplay screen.
+        Gameplay resets or pauses that clock while transitioning from the
+        preview to the newly loaded player. Treat the reset/pause as a boundary,
+        but do not anchor on it until the clock is observed moving afterwards;
+        the reset can happen while the player is still loading.
+
+        If the reader was launched after ENTER, it may be too late to see the
+        transition boundary. ``allow_running_without_boundary`` retains a
+        short early-time fallback for that compatibility mode. A reader armed
+        before ENTER should disable the fallback so song-select preview samples
+        cannot be mistaken for gameplay.
+        """
+
+        if boundary_samples < 1:
+            raise ValueError("boundary_samples must be positive")
+        if boundary_epsilon_ms < 0:
+            raise ValueError("boundary_epsilon_ms must be non-negative")
+        if stable_boundary_duration_ms < 0:
+            raise ValueError("stable boundary duration must be non-negative")
+        if running_samples < 2:
+            raise ValueError("running_samples must be at least 2")
+        if min_delta_ms < 0:
+            raise ValueError("min_delta_ms must be non-negative")
+        if stable_boundary_max_ms is not None and stable_boundary_max_ms < 0:
+            raise ValueError("stable_boundary_max_ms must be non-negative")
+
+        deadline = time.perf_counter() + timeout_s
+        previous = self._last_sample
+        stable_count = 1 if previous is not None else 0
+        stable_since_qpc = previous.qpc_seconds if previous is not None else None
+        saw_gameplay_boundary = False
+        recent_running: list[ClockSample] = []
+
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise ClockSyncError(
+                    f"osu!lazer gameplay clock did not restart within {timeout_s:.1f}s"
+                )
+
+            event = self._next_event(remaining)
+            event_type = event.get("event")
+            if event_type == "error":
+                raise ClockSyncError(str(event.get("message", "clock reader error")))
+            if event_type not in {"ready", "sample", "jump"}:
+                continue
+
+            sample = _event_to_sample(event)
+            if sample is None:
+                continue
+
+            in_range = max_time_ms is None or sample.time_ms <= max_time_ms
+            if previous is not None:
+                source_changed = (
+                    previous.source_address is not None
+                    and sample.source_address is not None
+                    and sample.source_address != previous.source_address
+                )
+                delta = sample.time_ms - previous.time_ms
+                if source_changed:
+                    saw_gameplay_boundary = True
+                    stable_count = 1
+                    stable_since_qpc = sample.qpc_seconds
+                    recent_running = [sample]
+                elif delta < -boundary_epsilon_ms:
+                    saw_gameplay_boundary = True
+                    stable_count = 1
+                    stable_since_qpc = sample.qpc_seconds
+                    recent_running = [sample]
+                elif abs(delta) <= boundary_epsilon_ms:
+                    if stable_count == 0 or stable_since_qpc is None:
+                        stable_since_qpc = previous.qpc_seconds
+                    stable_count += 1
+                    stable_duration_ms = (
+                        sample.qpc_seconds - stable_since_qpc
+                    ) * 1000.0
+                    if (
+                        stable_count >= boundary_samples
+                        and stable_duration_ms >= stable_boundary_duration_ms
+                    ):
+                        saw_gameplay_boundary = True
+                    recent_running = [sample]
+                elif delta > boundary_epsilon_ms:
+                    stable_count = 0
+                    stable_since_qpc = None
+                    recent_running.append(sample)
+                    if len(recent_running) > running_samples:
+                        recent_running = recent_running[-running_samples:]
+                    if saw_gameplay_boundary:
+                        return sample
+                    early_running_range = (
+                        in_range
+                        and (
+                            stable_boundary_max_ms is None
+                            or sample.time_ms <= stable_boundary_max_ms
+                        )
+                    )
+                    if (
+                        allow_running_without_boundary
+                        and len(recent_running) >= running_samples
+                        and early_running_range
+                    ):
+                        elapsed_s = recent_running[-1].qpc_seconds - recent_running[0].qpc_seconds
+                        delta_ms = recent_running[-1].time_ms - recent_running[0].time_ms
+                        if elapsed_s > 0 and delta_ms >= min_delta_ms:
+                            rate_ms_per_s = delta_ms / elapsed_s
+                            if 100.0 <= rate_ms_per_s <= 3000.0:
+                                return recent_running[-1]
+                else:
+                    stable_count = 0
+                    stable_since_qpc = None
+                    recent_running.clear()
+            elif in_range:
+                stable_count = 1
+                stable_since_qpc = sample.qpc_seconds
+                recent_running = [sample]
+            previous = sample
+
     def discard_pending_events(self) -> None:
         while True:
             try:
-                self._events.get_nowait()
+                self._remember_event(self._events.get_nowait())
             except queue.Empty:
                 return
 
@@ -291,9 +427,16 @@ class LazerClockReader:
 
     def _next_event(self, timeout_s: float) -> dict[str, object]:
         try:
-            return self._events.get(timeout=max(timeout_s, 0.001))
+            event = self._events.get(timeout=max(timeout_s, 0.001))
+            self._remember_event(event)
+            return event
         except queue.Empty as exc:
             raise ClockSyncError("timed out waiting for osu!lazer clock reader") from exc
+
+    def _remember_event(self, event: dict[str, object]) -> None:
+        sample = _event_to_sample(event)
+        if sample is not None:
+            self._last_sample = sample
 
 
 def start_clock_reader(
@@ -331,9 +474,11 @@ def initial_key_mask(frames: Sequence[object], frame_index: int) -> int:
 
 def _event_to_sample(event: dict[str, object]) -> ClockSample | None:
     try:
+        source_address = event.get("current_time_address")
         return ClockSample(
             time_ms=float(event["time_ms"]),
             qpc_seconds=float(event["qpc_seconds"]),
+            source_address=str(source_address) if source_address is not None else None,
         )
     except (KeyError, TypeError, ValueError):
         return None

@@ -7,9 +7,14 @@ Usage:
                             [--tune-n 30] [--tune-threshold 10]
                             [--tune-n2 150] [--tune-threshold2 5]
                             [--speed 1.5] [--k1 Z] [--k2 X]
+                            [--skip 1 5]
+                            [--post-enter-wait-s 0]
+                            [--startup-wait-s 3]
+                            [--bot-ready-timeout-s 10]
+                            [--start-bot-after-enter]
 """
 
-import ctypes, time, sys, argparse, subprocess, json, urllib.request
+import ctypes, time, sys, argparse, subprocess, json, random, urllib.request
 from ctypes import wintypes, byref, sizeof, Structure, Union
 from pathlib import Path
 
@@ -25,6 +30,9 @@ IM, IK = 0, 1
 MF_M, MF_A = 0x0001, 0x8000
 KF_UP = 0x0002
 KF_SCANCODE = 0x0008
+ABSOLUTE_COORDINATE_MAX = 65535
+SAFE_CURSOR_MIN_RATIO = 0.35
+SAFE_CURSOR_MAX_RATIO = 0.65
 
 class MI(Structure):
     _fields_=[("dx",wintypes.LONG),("dy",wintypes.LONG),("md",wintypes.DWORD),
@@ -46,6 +54,19 @@ def send_key(vk, down):
 
 def tap(vk, dur=0.06):
     send_key(vk, True); time.sleep(dur); send_key(vk, False); time.sleep(0.03)
+
+def random_safe_cursor_position(rng):
+    return (
+        round(rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * ABSOLUTE_COORDINATE_MAX),
+        round(rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * ABSOLUTE_COORDINATE_MAX),
+    )
+
+def move_mouse_absolute(x, y):
+    i = INP(tp=IM)
+    i.u.mi.dx = x
+    i.u.mi.dy = y
+    i.u.mi.fl = MF_M | MF_A
+    ctypes.windll.user32.SendInput(1, byref(i), sizeof(i))
 
 WM_CHAR = 0x0102
 
@@ -133,13 +154,45 @@ def main():
                         help="Use the replay bot's legacy local timer")
     parser.add_argument("--no-space", action="store_true",
                         help="Do not press SPACE; sync to the running gameplay clock")
-    parser.add_argument("--pre-enter-wait-s", type=float, default=5.0,
-                        help="seconds to let replay_bot_enter initialize before ENTER in --no-space mode")
+    parser.add_argument("--post-enter-wait-s", type=float, default=0.0,
+                        help="optional extra seconds after ENTER; clock sync handles loading by default")
     parser.add_argument("--start-from", type=int, default=0,
                         help="start from this index (0-based) in the manifest")
     parser.add_argument("--count", type=int, default=0,
                         help="max beatmaps to play (0 = all)")
+    parser.add_argument(
+        "--skip",
+        "--skip-indices",
+        dest="skip_indices",
+        nargs="+",
+        metavar="INDEX",
+        help="skip manifest entries by 1-based position, e.g. --skip 1 5 or --skip 1,5",
+    )
+    parser.add_argument("--startup-wait-s", type=float, default=3.0,
+                        help="seconds to wait before processing the first beatmap")
+    parser.add_argument("--bot-ready-timeout-s", type=float, default=10.0,
+                        help="seconds to wait for replay_bot_enter to arm before ENTER")
+    parser.add_argument("--start-bot-after-enter", action="store_true",
+                        help="legacy mode: press ENTER before launching the replay bot")
     args = parser.parse_args()
+
+    if args.startup_wait_s < 0:
+        parser.error("--startup-wait-s must be non-negative")
+    if args.post_enter_wait_s < 0:
+        parser.error("--post-enter-wait-s must be non-negative")
+    if args.bot_ready_timeout_s < 0:
+        parser.error("--bot-ready-timeout-s must be non-negative")
+
+    skip_indices: set[int] = set()
+    for raw_value in args.skip_indices or []:
+        for value in raw_value.split(","):
+            try:
+                index = int(value)
+            except ValueError:
+                parser.error(f"--skip expects positive manifest positions, got {value!r}")
+            if index < 1:
+                parser.error(f"--skip expects positive manifest positions, got {index}")
+            skip_indices.add(index)
 
     # Load manifest
     with open(args.manifest, encoding='utf-8') as f:
@@ -153,6 +206,8 @@ def main():
     print(f"  Leadin: {args.leadin_time}ms | Advance: {args.advance}ms")
     print(f"  Tune: {args.tune_n} hits @{args.tune_threshold}ms → {args.tune_n2} hits @{args.tune_threshold2}ms")
     print(f"  Speed: {args.speed}x | Keys: {args.k1}/{args.k2}")
+    if skip_indices:
+        print(f"  Skip manifest positions: {', '.join(str(index) for index in sorted(skip_indices))}")
     print(f"{'='*60}")
 
     # --- Start tosu only when auto-tune is explicitly requested ---
@@ -201,7 +256,10 @@ def main():
     else:
         print("Clock-synchronized playback is ready. Switch to osu!lazer now!")
     print("F7 = STOP EVERYTHING")
+    print(f"Starting first beatmap in {args.startup_wait_s:.1f}s...")
     print(f"{'='*60}\n")
+
+    time.sleep(args.startup_wait_s)
 
     # F7 global stop flag
     import threading
@@ -217,6 +275,7 @@ def main():
     f7_thread.start()
 
     bot_script = Path(__file__).resolve().parent / "replay_bot_enter.py"
+    cursor_rng = random.Random()
 
     max_count = args.count if args.count > 0 else len(items)
     played = 0
@@ -224,6 +283,9 @@ def main():
         if played >= max_count or f7_stop[0]:
             break
         item = items[idx]
+        if idx + 1 in skip_indices:
+            print(f"\n[{idx+1}/{len(items)}] beatmap {item.get('beatmap_id', '?')}: skipped by request")
+            continue
         if f7_stop[0]:
             break
         bid = item["beatmap_id"]
@@ -241,6 +303,9 @@ def main():
 
         # Clear search and type beatmap ID
         print("  Typing beatmap ID...")
+        if played > 0:
+            cursor_x, cursor_y = random_safe_cursor_position(cursor_rng)
+            move_mouse_absolute(cursor_x, cursor_y)
         press_backspace(10)
         time.sleep(0.2)
         type_into_osu(str(bid))
@@ -261,8 +326,6 @@ def main():
             cmd.append("--auto-tune")
         if args.no_space:
             cmd.append("--no-space")
-        else:
-            cmd.append("--skip-enter-wait")
         if not args.no_clock_sync:
             cmd.append("--clock-sync")
             cmd.extend(["--clock-sync-timeout-ms", str(args.clock_sync_timeout_ms)])
@@ -273,36 +336,76 @@ def main():
             cmd.append("--no-clock-sync")
 
         proc = None
-        if args.no_space:
+        output_thread = None
+        bot_ready = threading.Event()
+
+        def forward_bot_output():
+            stream = proc.stdout if proc is not None else None
+            if stream is None:
+                return
+            for line in stream:
+                print(line, end="")
+                if "Waiting for ENTER" in line:
+                    bot_ready.set()
+
+        if args.start_bot_after_enter:
+            # Legacy mode: ENTER first, then bot startup. This is useful as a
+            # fallback, but can miss very early gameplay clocks on fast maps.
+            cmd.append("--skip-enter-wait")
+        else:
             print(f"  Starting bot before ENTER: {' '.join(cmd)}")
-            proc = subprocess.Popen(cmd)
-            ready_wait = max(0.0, args.pre_enter_wait_s)
-            print(f"  Waiting {ready_wait:.1f}s for bot clock reader...")
-            deadline = time.time() + ready_wait
-            while time.time() < deadline:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            output_thread = threading.Thread(target=forward_bot_output, daemon=True)
+            output_thread.start()
+
+            deadline = time.perf_counter() + args.bot_ready_timeout_s
+            while not bot_ready.is_set():
                 if f7_stop[0]:
                     break
                 if proc.poll() is not None:
+                    print(f"  Bot exited before ENTER with code {proc.returncode}, stopping batch.")
                     break
-                time.sleep(0.1)
-            if proc.poll() is not None:
-                print(f"  Bot exited before ENTER with code {proc.returncode}, stopping batch.")
+                if time.perf_counter() >= deadline:
+                    print(f"  Bot was not ready for ENTER within {args.bot_ready_timeout_s:.1f}s, stopping batch.")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2.0)
+                    break
+                time.sleep(0.02)
+            if f7_stop[0] or not bot_ready.is_set() or proc.poll() is not None:
                 break
 
         # Press ENTER to start play
         print(f"  Pressing ENTER (beatmap {bid})...")
         hwnd = find_osu_hwnd()
         if hwnd:
-            ctypes.windll.user32.PostMessageW(hwnd, 0x0100, 0x0D, 0)  # WM_KEYDOWN VK_RETURN
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
             time.sleep(0.05)
-            ctypes.windll.user32.PostMessageW(hwnd, 0x0101, 0x0D, 0)  # WM_KEYUP VK_RETURN
-        else:
-            press_enter()
-        time.sleep(0.3)
-
+        press_enter()
+        if args.post_enter_wait_s > 0:
+            print(f"  Extra post-ENTER wait: {args.post_enter_wait_s:.1f}s")
+            deadline = time.perf_counter() + args.post_enter_wait_s
+            while time.perf_counter() < deadline:
+                if f7_stop[0]:
+                    break
+                time.sleep(min(0.1, deadline - time.perf_counter()))
+            if f7_stop[0]:
+                break
         if proc is None:
-            print(f"  Running: {' '.join(cmd)}")
+            print(f"  Starting bot after ENTER: {' '.join(cmd)}")
             proc = subprocess.Popen(cmd)
+
         while proc.poll() is None:
             if f7_stop[0]:
                 print("  F7 pressed, killing bot...")

@@ -44,13 +44,25 @@ def test_parser_exposes_playback_controls(tmp_path: Path) -> None:
         "second.osr",
         "output.osr",
         "--no-dt",
+        "--synthesis-seed",
+        "7",
     ])
     assert synthesize.dt is False
+    assert synthesize.synthesis_seed == 7
 
-    batch = parser.parse_args(["batch-dt", "1", "--no-skip-filter"])
+    batch = parser.parse_args([
+        "batch-dt",
+        "1",
+        "--no-skip-filter",
+        "--random-search-pages",
+        "7",
+    ])
     assert batch.no_skip_filter is True
+    assert batch.min_skip_time == 0
     assert batch.spinner_mode == "all"
     assert batch.dt is True
+    assert batch.beatmap_selection == "random-all"
+    assert batch.random_search_pages == 7
 
     download = parser.parse_args([
         "download-synthesize",
@@ -60,8 +72,11 @@ def test_parser_exposes_playback_controls(tmp_path: Path) -> None:
         "output.osr",
         "--lazer-path",
         str(tmp_path / "lazer"),
+        "--synthesis-seed",
+        "8",
     ])
     assert download.lazer_path == tmp_path / "lazer"
+    assert download.synthesis_seed == 8
 
 
 def test_synthesize_command_writes_readable_osr(tmp_path: Path) -> None:
@@ -133,12 +148,18 @@ def test_synthesize_command_accepts_weights(tmp_path: Path) -> None:
             "3",
             "--second-weight",
             "1",
+            "--synthesis-seed",
+            "0",
         ]
     )
 
     assert exit_code == 0
     output = OsrReplay.read_path(output_path)
-    first_weight, second_weight = effective_weights(10, 3.0, 1.0)
+    from synthesis_osu_play.synthesis import DYNAMIC_PHASE_NOISE_STD_RAD
+    import random
+
+    phase_offset = random.Random(0).gauss(0.0, DYNAMIC_PHASE_NOISE_STD_RAD)
+    first_weight, second_weight = effective_weights(10, 3.0, 1.0, phase_offset_rad=phase_offset)
     assert output.frames[1].x == pytest.approx(10.0 * second_weight)
     assert output.frames[1].y == pytest.approx(10.0 * second_weight)
 
@@ -291,6 +312,8 @@ def test_batch_dt_command_invokes_batch_workflow(tmp_path: Path, monkeypatch) ->
             "5.2",
             "--random-seed",
             "7",
+            "--random-search-pages",
+            "4",
             "--lazer-path",
             str(tmp_path / "lazer"),
         ]
@@ -304,6 +327,7 @@ def test_batch_dt_command_invokes_batch_workflow(tmp_path: Path, monkeypatch) ->
     assert captured["kwargs"]["min_star"] == 4.8
     assert captured["kwargs"]["max_star"] == 5.2
     assert captured["kwargs"]["random_seed"] == 7
+    assert captured["kwargs"]["random_search_pages"] == 4
     assert captured["import_report"].output_dir == tmp_path / "exports"
     assert captured["lazer_path"] == tmp_path / "lazer"
 
