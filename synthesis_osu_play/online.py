@@ -32,6 +32,7 @@ DEVELOPMENT_API_URL = "https://dev.ppy.sh"
 DEVELOPMENT_CLIENT_SECRET = "3LP2mhUrV89xxzD1YKNndXHEhWWCRLPNKioZ9ymT"
 MAX_SCORE_REQUEST_LIMIT = 100
 DEFAULT_SCORE_REQUEST_LIMIT = 50
+MAX_RANDOM_SEARCH_PAGE = 200
 DEFAULT_BATCH_OUTPUT_DIR = Path(r"D:\osu-lazer\exports")
 DEFAULT_BATCH_WORK_DIR = Path("artifacts") / "batch-dt"
 API_REQUEST_TIMEOUT_S = 30
@@ -232,6 +233,7 @@ class OsuApiClient:
         mode: str = "osu",
         status: str = "ranked",
         sort: str = "ranked_desc",
+        page: int | None = None,
         cursor_string: str | None = None,
     ) -> dict[str, Any]:
         query: dict[str, object] = {
@@ -239,6 +241,8 @@ class OsuApiClient:
             "s": status,
             "sort": sort,
         }
+        if page is not None:
+            query["page"] = page
         if cursor_string:
             query["cursor_string"] = cursor_string
         payload = self.get_json("beatmapsets/search", query)
@@ -347,6 +351,7 @@ def download_and_synthesize(
     player_name: str | None = None,
     first_weight: float = 1.0,
     second_weight: float = 1.0,
+    synthesis_seed: int | None = None,
     scope: str = "global",
     ruleset: str = "osu",
     mods: Iterable[str] = (),
@@ -426,6 +431,7 @@ def download_and_synthesize(
         player_name=player_name,
         first_weight=first_weight,
         second_weight=second_weight,
+        synthesis_seed=synthesis_seed,
         recompute_score_metadata=recompute_score_metadata,
         output_mods=output_mods,
         spinner_library_path=spinner_library_path,
@@ -487,6 +493,7 @@ def batch_synthesize_dt(
     *,
     output_dir: str | Path = DEFAULT_BATCH_OUTPUT_DIR,
     work_dir: str | Path = DEFAULT_BATCH_WORK_DIR,
+    beatmap_selection: str = "random-all",
     min_age_days: int = 3,
     min_star: float = 4.5,
     max_star: float = 5.0,
@@ -499,10 +506,12 @@ def batch_synthesize_dt(
     api_url: str = PRODUCTION_API_URL,
     api_version: int | None = None,
     leaderboard_limit: int = MAX_SCORE_REQUEST_LIMIT,
-    search_pages_limit: int = 25,
+    search_pages_limit: int | None = None,
+    random_search_pages: int | None = None,
     request_delay_s: float = 2.0,
     random_seed: int | None = None,
-    min_skip_time_ms: int = 4000,
+    synthesis_seed: int | None = None,
+    min_skip_time_ms: int = 0,
     spinner_library_path: str | Path | None = None,
     spinner_mode: str = "all",
     dt_mode: bool = True,
@@ -510,8 +519,18 @@ def batch_synthesize_dt(
 ) -> BatchSynthesisReport:
     if count < 1:
         raise OnlineSynthesisError("batch count must be positive")
+    if beatmap_selection not in {"recent", "random-all"}:
+        raise OnlineSynthesisError(f"unknown beatmap selection mode: {beatmap_selection}")
     if min_age_days < 0:
         raise OnlineSynthesisError("minimum age must be non-negative")
+    if search_pages_limit is not None and search_pages_limit < 1:
+        raise OnlineSynthesisError("search page limit must be positive")
+    if random_search_pages is not None and random_search_pages < 1:
+        raise OnlineSynthesisError("random search page limit must be positive")
+    if random_search_pages is not None and random_search_pages > MAX_RANDOM_SEARCH_PAGE:
+        raise OnlineSynthesisError(
+            f"random search page limit cannot exceed {MAX_RANDOM_SEARCH_PAGE}"
+        )
     if min_star > max_star:
         raise OnlineSynthesisError("minimum star rating cannot exceed maximum star rating")
     leaderboard_limit = max(2, min(MAX_SCORE_REQUEST_LIMIT, leaderboard_limit))
@@ -535,84 +554,196 @@ def batch_synthesize_dt(
         )
 
     rng = random.Random(random_seed)
+    synthesis_rng = random.Random(synthesis_seed) if synthesis_seed is not None else None
     cutoff = datetime.now(timezone.utc).timestamp() - min_age_days * 24 * 60 * 60
     items: list[BatchSynthesisItem] = []
     seen_beatmap_ids: set[int] = set()
     cursor_string: str | None = None
     pages = 0
+    random_pages_used = 0
 
     if min_skip_time_ms < 0:
         raise OnlineSynthesisError("minimum skip time must be non-negative")
 
-    LOGGER.info(
-        "Searching ranked beatmaps (>= %sd old, %s-%s*), skip>= %sms...",
-        min_age_days,
-        min_star,
-        max_star,
-        min_skip_time_ms,
-    )
-    while len(items) < count and pages < search_pages_limit:
-        pages += 1
-        payload = client.search_beatmapsets(
-            mode=ruleset,
-            status="ranked",
-            sort="ranked_desc",
-            cursor_string=cursor_string,
+    if beatmap_selection == "random-all":
+        LOGGER.info(
+            "Preparing global random-time selection for ranked beatmaps (%s-%s*), skip>= %sms...",
+            min_star,
+            max_star,
+            min_skip_time_ms,
         )
-        (work_dir / f"search_page_{pages}.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+    else:
+        LOGGER.info(
+            "Searching ranked beatmaps (>= %sd old, %s-%s*), skip>= %sms...",
+            min_age_days,
+            min_star,
+            max_star,
+            min_skip_time_ms,
         )
-        candidates = search_candidates_from_payload(payload, min_star=min_star, max_star=max_star)
-        LOGGER.info("page %s: %s candidates in star range, %s/%s collected", pages, len(candidates), len(items), count)
-        for candidate in candidates:
+
+    def process_candidate(candidate: BeatmapSearchCandidate) -> BatchSynthesisItem | None:
+        candidate_label = (
+            f"[{len(items)+1}/{count}] beatmap {candidate.beatmap_id}: "
+            f"{candidate.title[:40]} [{candidate.version[:20]}] ({candidate.difficulty_rating:.2f}*)"
+        )
+        try:
+            item = try_synthesize_batch_candidate(
+                client,
+                candidate,
+                len(items) + 1,
+                output_dir=output_dir,
+                work_dir=work_dir,
+                player_name=player_name,
+                scope=scope,
+                ruleset=ruleset,
+                no_video=no_video,
+                leaderboard_limit=leaderboard_limit,
+                rng=rng,
+                synthesis_seed=(
+                    synthesis_rng.getrandbits(64)
+                    if synthesis_rng is not None
+                    else None
+                ),
+                min_skip_time_ms=min_skip_time_ms,
+                spinner_library_path=spinner_library_path,
+                spinner_mode=spinner_mode,
+                dt_mode=dt_mode,
+            )
+            if item is not None:
+                LOGGER.info("%s ... OK (%s/%s)", candidate_label, item.first_score.username, item.second_score.username)
+            else:
+                LOGGER.info("%s ... SKIP (intro too short)", candidate_label)
+            return item
+        except (OnlineSynthesisError, OSError, ValueError) as exc:
+            LOGGER.info("%s ... FAIL (%s)", candidate_label, exc)
+            write_batch_skip_reason(work_dir, candidate, str(exc))
+            return None
+
+    if beatmap_selection == "random-all":
+        page_limit = random_search_pages or MAX_RANDOM_SEARCH_PAGE
+        start_page = rng.randint(1, MAX_RANDOM_SEARCH_PAGE)
+        random_sort = rng.choice(("ranked_desc", "ranked_asc"))
+        LOGGER.info(
+            "Starting random ranked search at page %s/%s (%s); will continue until %s replay(s) are synthesized (max %s page(s))...",
+            start_page,
+            MAX_RANDOM_SEARCH_PAGE,
+            random_sort,
+            count,
+            page_limit,
+        )
+        for page_index in range(page_limit):
+            random_pages_used = page_index + 1
+            random_page = ((start_page - 1 + page_index) % MAX_RANDOM_SEARCH_PAGE) + 1
+            payload = client.search_beatmapsets(
+                mode=ruleset,
+                status="ranked",
+                sort=random_sort,
+                page=random_page,
+            )
+            (work_dir / f"random_search_page_{page_index + 1}_p{random_page}_{random_sort}.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            candidates = search_candidates_from_payload(
+                payload,
+                min_star=min_star,
+                max_star=max_star,
+                all_eligible_difficulties=True,
+            )
+            unique_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.beatmap_id not in seen_beatmap_ids
+            ]
+            for candidate in unique_candidates:
+                seen_beatmap_ids.add(candidate.beatmap_id)
+            rng.shuffle(unique_candidates)
+            LOGGER.info(
+                "random page %s/%s (page=%s, %s): %s eligible candidates, %s/%s synthesized",
+                page_index + 1,
+                page_limit,
+                random_page,
+                random_sort,
+                len(unique_candidates),
+                len(items),
+                count,
+            )
+            for candidate in unique_candidates:
+                if len(items) >= count:
+                    break
+                item = process_candidate(candidate)
+                if item is not None:
+                    items.append(item)
             if len(items) >= count:
                 break
-            if candidate.beatmap_id in seen_beatmap_ids:
-                continue
-            seen_beatmap_ids.add(candidate.beatmap_id)
-            if candidate.ranked_date.timestamp() > cutoff:
-                continue
-            candidate_label = (
-                f"[{len(items)+1}/{count}] beatmap {candidate.beatmap_id}: "
-                f"{candidate.title[:40]} [{candidate.version[:20]}] ({candidate.difficulty_rating:.2f}*)"
+    else:
+        page_limit = search_pages_limit
+        if page_limit is None:
+            page_limit = 25
+        while page_limit is None or pages < page_limit:
+            if len(items) >= count:
+                break
+            pages += 1
+            payload = client.search_beatmapsets(
+                mode=ruleset,
+                status="ranked",
+                sort="ranked_desc",
+                cursor_string=cursor_string,
             )
-            try:
-                item = try_synthesize_batch_candidate(
-                    client,
-                    candidate,
-                    len(items) + 1,
-                    output_dir=output_dir,
-                    work_dir=work_dir,
-                    player_name=player_name,
-                    scope=scope,
-                    ruleset=ruleset,
-                    no_video=no_video,
-                    leaderboard_limit=leaderboard_limit,
-                    rng=rng,
-                    min_skip_time_ms=min_skip_time_ms,
-                    spinner_library_path=spinner_library_path,
-                    spinner_mode=spinner_mode,
-                    dt_mode=dt_mode,
+            (work_dir / f"search_page_{pages}.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            candidates = search_candidates_from_payload(
+                payload,
+                min_star=min_star,
+                max_star=max_star,
+            )
+            unique_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.beatmap_id not in seen_beatmap_ids
+            ]
+            for candidate in unique_candidates:
+                seen_beatmap_ids.add(candidate.beatmap_id)
+            age_eligible_candidates = [
+                candidate
+                for candidate in unique_candidates
+                if candidate.ranked_date.timestamp() <= cutoff
+            ]
+            LOGGER.info(
+                "page %s: %s candidates in star range, %s age-qualified, %s/%s collected",
+                pages,
+                len(candidates),
+                len(age_eligible_candidates),
+                len(items),
+                count,
+            )
+            if not age_eligible_candidates:
+                LOGGER.info(
+                    "page %s: no candidates at least %s days old; continuing to the next page",
+                    pages,
+                    min_age_days,
                 )
+            for candidate in age_eligible_candidates:
+                if len(items) >= count:
+                    break
+                item = process_candidate(candidate)
                 if item is not None:
-                    LOGGER.info("%s ... OK (%s/%s)", candidate_label, item.first_score.username, item.second_score.username)
-                else:
-                    LOGGER.info("%s ... SKIP (intro too short)", candidate_label)
-            except (OnlineSynthesisError, OSError, ValueError) as exc:
-                LOGGER.info("%s ... FAIL (%s)", candidate_label, exc)
-                write_batch_skip_reason(work_dir, candidate, str(exc))
-                continue
-            if item is not None:
-                items.append(item)
+                    items.append(item)
 
-        cursor_string = cursor_string_from_payload(payload)
-        if not cursor_string:
-            break
+            cursor_string = cursor_string_from_payload(payload)
+            if not cursor_string:
+                break
 
     if len(items) < count:
+        search_summary = (
+            f"{random_pages_used} random ranked search page(s)"
+            if beatmap_selection == "random-all"
+            else f"{pages} search page(s)"
+        )
         raise OnlineSynthesisError(
-            f"only synthesized {len(items)} replay(s) after scanning {pages} search page(s); requested {count}"
+            f"only synthesized {len(items)} replay(s) after {search_summary}; requested {count}"
         )
 
     manifest_path = output_dir / "batch_manifest.json"
@@ -638,7 +769,8 @@ def try_synthesize_batch_candidate(
     no_video: bool,
     leaderboard_limit: int,
     rng: random.Random,
-    min_skip_time_ms: int = 4000,
+    synthesis_seed: int | None = None,
+    min_skip_time_ms: int = 0,
     spinner_library_path: str | Path | None = None,
     spinner_mode: str = "all",
     dt_mode: bool = True,
@@ -681,6 +813,7 @@ def try_synthesize_batch_candidate(
         second,
         beatmap=beatmap,
         player_name=player_name,
+        synthesis_seed=synthesis_seed,
         output_mods=MOD_DOUBLE_TIME,
         allow_source_mod_mismatch=True,
         spinner_library_path=str(spinner_library_path) if spinner_library_path is not None else None,
@@ -730,6 +863,7 @@ def search_candidates_from_payload(
     *,
     min_star: float,
     max_star: float,
+    all_eligible_difficulties: bool = False,
 ) -> list[BeatmapSearchCandidate]:
     beatmapsets = payload.get("beatmapsets")
     if not isinstance(beatmapsets, list):
@@ -762,20 +896,25 @@ def search_candidates_from_payload(
                 eligible.append(beatmap)
         if not eligible:
             continue
-        beatmap = max(eligible, key=lambda item: float(item.get("difficulty_rating", 0.0)))
-        candidates.append(
-            BeatmapSearchCandidate(
-                beatmapset_id=set_id,
-                beatmap_id=int_field(beatmap, "id"),
-                ranked_date=ranked_date,
-                difficulty_rating=float(beatmap.get("difficulty_rating")),
-                title=title,
-                version=stringish(beatmap.get("version")),
-                checksum=string_field(beatmap, "checksum", required=False),
-                raw_beatmapset=beatmapset,
-                raw_beatmap=beatmap,
-            )
+        selected_beatmaps = (
+            eligible
+            if all_eligible_difficulties
+            else [max(eligible, key=lambda item: float(item.get("difficulty_rating", 0.0)))]
         )
+        for beatmap in selected_beatmaps:
+            candidates.append(
+                BeatmapSearchCandidate(
+                    beatmapset_id=set_id,
+                    beatmap_id=int_field(beatmap, "id"),
+                    ranked_date=ranked_date,
+                    difficulty_rating=float(beatmap.get("difficulty_rating")),
+                    title=title,
+                    version=stringish(beatmap.get("version")),
+                    checksum=string_field(beatmap, "checksum", required=False),
+                    raw_beatmapset=beatmapset,
+                    raw_beatmap=beatmap,
+                )
+            )
     return sorted(candidates, key=lambda item: item.ranked_date, reverse=True)
 
 
@@ -1133,7 +1272,9 @@ def batch_beatmap_archive_paths(report: BatchSynthesisReport) -> tuple[Path, ...
         if item.beatmapset_id in seen_beatmapset_ids:
             continue
         seen_beatmapset_ids.add(item.beatmapset_id)
-        archives.append(report.work_dir / str(item.beatmap_id) / f"beatmapset_{item.beatmapset_id}.osz")
+        archives.append(
+            (report.work_dir / str(item.beatmap_id) / f"beatmapset_{item.beatmapset_id}.osz").resolve()
+        )
     return tuple(archives)
 
 
@@ -1172,26 +1313,30 @@ def import_batch_beatmaps(report: BatchSynthesisReport, *, lazer_path: str | Pat
         )
 
     lazer_executable = resolve_lazer_executable(lazer_path)
-    imported: list[Path] = []
-    for i, path in enumerate(archive_paths):
-        try:
-            proc = subprocess.Popen(
-                [str(lazer_executable), str(path)],
-                cwd=str(lazer_executable.parent),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+    command = [str(lazer_executable), *(str(path) for path in archive_paths)]
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(lazer_executable.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        returncode = proc.wait(timeout=30)
+        if returncode != 0:
+            LOGGER.warning(
+                "osu!lazer batch import process exited with code %s for %s archive(s)",
+                returncode,
+                len(archive_paths),
             )
-            proc.wait(timeout=30)
-            imported.append(path)
-            if i % 3 == 2:
-                time.sleep(1.0)
-        except OSError as exc:
-            LOGGER.warning("import failed for %s: %s", path, exc)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            proc.wait()
-    return tuple(imported)
+            return ()
+        return archive_paths
+    except OSError as exc:
+        LOGGER.warning("batch import failed: %s", exc)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait()
+    return ()
 
 
 def extract_beatmap_file(

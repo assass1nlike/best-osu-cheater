@@ -1,9 +1,9 @@
 """
-Replay Bot (ENTER variant) - ENTER triggers a fixed-delay SPACE + replay start.
-Designed for skip-mode replays where the lead-in pause must align with SPACE.
+Replay Bot (ENTER variant) - ENTER triggers automatic clock-aligned playback.
+By default it detects whether the opening intro can be skipped with SPACE.
 
 Usage:
-  python replay_bot_enter.py <replay.osr> [--leadin-time 6000] [--advance 0] ...
+  python replay_bot_enter.py <replay.osr> [--advance 0] [--speed 1.0] ...
 """
 import ctypes, time, sys, argparse, json, threading, os, subprocess, urllib.request
 from ctypes import wintypes, byref, sizeof, Structure, Union
@@ -30,6 +30,13 @@ KF_UP = 0x0002
 KF_SCANCODE = 0x0008
 VK_Z, VK_X, VK_SPACE, VK_F7, VK_ESC, VK_RETURN = 0x5A, 0x58, 0x20, 0x76, 0x1B, 0x0D
 KM1, KM2, KK1, KK2 = 1, 2, 4, 8
+LAZER_MINIMUM_SKIP_TIME_MS = 1000.0
+AUTO_SPACE_EXTRA_LEAD_MS = 1000.0
+
+def should_try_auto_space(current_time_ms, first_key_time_ms, extra_lead_ms=AUTO_SPACE_EXTRA_LEAD_MS):
+    if first_key_time_ms is None:
+        return False
+    return first_key_time_ms - current_time_ms >= LAZER_MINIMUM_SKIP_TIME_MS + extra_lead_ms
 
 class MI(Structure):
     _fields_=[("dx",wintypes.LONG),("dy",wintypes.LONG),("md",wintypes.DWORD),
@@ -142,11 +149,12 @@ def main():
     parser.add_argument('--k2', default='X',
                         help='K2 key (default: X)')
     parser.add_argument('--leadin-time', type=int, default=6000,
-                        help='ms after ENTER to press SPACE; used as fixed-delay fallback with --no-space --no-clock-sync')
-    parser.add_argument('--space', dest='send_space', action='store_true', default=True,
-                        help='press SPACE after lead-in and sync to the accepted skip jump (default)')
-    parser.add_argument('--no-space', dest='send_space', action='store_false',
-                        help='do not press SPACE; sync when the gameplay clock starts moving')
+                        help='ms after ENTER before the fixed-delay SPACE fallback')
+    start_group = parser.add_mutually_exclusive_group()
+    start_group.add_argument('--space', dest='send_space', action='store_const', const=True, default=None,
+                             help='force SPACE after the fixed lead-in')
+    start_group.add_argument('--no-space', dest='send_space', action='store_const', const=False,
+                             help='force no SPACE; sync when the gameplay clock starts moving')
     parser.add_argument('--skip-enter-wait', action='store_true',
                         help='skip waiting for ENTER (caller already pressed it)')
     parser.add_argument('--speed', type=float, default=1.0,
@@ -227,11 +235,15 @@ def main():
     frames=r.replay_data
     timeline = ReplayTimeline.from_frames(frames)
     first_key_time_ms = timeline.first_key_time_ms(frames)
+    clock_anchor_limit_ms = None
+    if first_key_time_ms is not None:
+        clock_anchor_limit_ms = max(float(first_key_time_ms), float(args.no_space_min_lead_ms))
     tms=sum(f.time_delta for f in frames) / speed
     skipped=sum(f.time_delta for f in frames if f.time_delta>1000) / speed
 
     print(f"  leadin: {args.leadin_time}ms | advance: {ADVANCE_MS}ms | speed: {speed}x")
-    print(f"  SPACE mode: {'on' if args.send_space else 'off'}")
+    space_mode = 'auto' if args.send_space is None else ('on' if args.send_space else 'off')
+    print(f"  SPACE mode: {space_mode}")
     if args.clock_sync:
         print("  Clock sync: enabled (osu!lazer CurrentTime)")
     th=r.count_300+r.count_100+r.count_50+r.count_miss
@@ -316,10 +328,12 @@ def main():
             print(f"\n{'='*55}")
             print("  1. Start the beatmap in osu!lazer")
             print("  2. Press ENTER to begin playing")
-            if args.send_space:
-                print("     (bot will auto-SPACE + replay after lead-in)")
-            else:
+            if args.send_space is True:
+                print("     (bot will send SPACE after the fixed lead-in)")
+            elif args.send_space is False:
                 print("     (bot will sync to the running gameplay clock; no SPACE)")
+            else:
+                print("     (bot will detect whether the opening intro accepts SPACE)")
             print("  F7 = ABORT")
             print(f"{'='*55}")
 
@@ -330,13 +344,16 @@ def main():
                     reader_path=args.clock_reader,
                     ready_timeout_ms=args.clock_sync_timeout_ms,
                     jump_threshold_ms=args.clock_jump_threshold_ms,
-                    wait_for_jump=args.send_space,
-                    stream_samples=not args.send_space,
+                    # Automatic mode must keep sampling through the song-select
+                    # preview; its first jump is not gameplay start.
+                    wait_for_jump=args.send_space is True,
+                    stream_samples=args.send_space is not True,
+                    sample_interval_ms=5,
                 )
                 print("  Clock reader: ready")
             except ClockSyncError as exc:
                 print(f"  WARNING: clock sync unavailable ({exc})")
-                if not args.send_space:
+                if args.send_space is False:
                     print("  ERROR: --no-space needs clock sync; use --no-clock-sync to force fixed lead-in fallback")
                     tosu_running[0] = False
                     sys.exit(1)
@@ -352,8 +369,11 @@ def main():
                     sys.exit(1)
                 time.sleep(0.005)
         # On auto-restart or skip-enter-wait, ENTER already sent
+        reader_armed_before_enter = run == 1 and not args.skip_enter_wait
 
-        if args.send_space:
+        send_space_fallback = False
+        space_accepted = False
+        if args.send_space is True:
             # Wait fixed lead-in time, then press SPACE + start replay
             print(f"  [Run {run}] ENTER detected. Waiting {args.leadin_time}ms...")
             time.sleep(leadin_s)
@@ -363,21 +383,20 @@ def main():
             if clock_reader is not None:
                 try:
                     sync_jump = clock_reader.wait_for_jump(args.clock_sync_timeout_ms / 1000.0)
+                    space_accepted = True
                 except ClockSyncError as exc:
                     print(f"  WARNING: SPACE clock jump not observed ({exc}); using legacy timer")
             mabs(center_ax, center_ay)
             print(f"  [Run {run}] SPACE sent + GO!")
-        else:
+        elif args.send_space is False:
             if clock_reader is not None:
                 clock_reader.discard_pending_events()
-                max_anchor_time = None
-                if first_key_time_ms is not None:
-                    max_anchor_time = first_key_time_ms - args.no_space_min_lead_ms
-                print(f"  [Run {run}] ENTER detected. Waiting for gameplay clock...")
+                print(f"  [Run {run}] ENTER detected. Waiting for gameplay clock restart...")
                 try:
-                    sync_jump = clock_reader.wait_for_running_clock(
+                    sync_jump = clock_reader.wait_for_gameplay_start(
                         args.no_space_sync_timeout_ms / 1000.0,
-                        max_time_ms=max_anchor_time,
+                        max_time_ms=clock_anchor_limit_ms,
+                        allow_running_without_boundary=not reader_armed_before_enter,
                     )
                 except ClockSyncError as exc:
                     print(f"  ERROR: no-space clock sync failed ({exc})")
@@ -388,6 +407,60 @@ def main():
                 time.sleep(leadin_s)
             mabs(center_ax, center_ay)
             print(f"  [Run {run}] GO! (no SPACE)")
+        else:
+            # Probe the live clock first so SPACE is only attempted during the opening intro.
+            if clock_reader is None:
+                print(f"  [Run {run}] WARNING: auto detection unavailable; using fixed-delay SPACE fallback")
+                time.sleep(leadin_s)
+                kkey(VK_SPACE, True); time.sleep(0.05); kkey(VK_SPACE, False)
+                send_space_fallback = True
+                mabs(center_ax, center_ay)
+                print(f"  [Run {run}] SPACE sent + GO! (fallback)")
+            else:
+                # Events collected while waiting for ENTER belong to the menu or previous play.
+                clock_reader.discard_pending_events()
+                print(f"  [Run {run}] ENTER detected. Waiting for the gameplay clock restart...")
+                try:
+                    running_sample = clock_reader.wait_for_gameplay_start(
+                        args.no_space_sync_timeout_ms / 1000.0,
+                        max_time_ms=clock_anchor_limit_ms,
+                        allow_running_without_boundary=not reader_armed_before_enter,
+                    )
+                except ClockSyncError as exc:
+                    print(f"  ERROR: automatic clock sync failed ({exc})")
+                    tosu_running[0] = False
+                    sys.exit(1)
+
+                can_skip_intro = should_try_auto_space(running_sample.time_ms, first_key_time_ms)
+                if can_skip_intro:
+                    print(
+                        f"  [Run {run}] Opening intro detected at lazer "
+                        f"{running_sample.time_ms:.1f}ms; trying SPACE..."
+                    )
+                    kkey(VK_SPACE, True); time.sleep(0.05); kkey(VK_SPACE, False)
+                    try:
+                        sync_jump = clock_reader.wait_for_jump(
+                            min(args.clock_sync_timeout_ms, 1000) / 1000.0
+                        )
+                        space_accepted = True
+                        print(f"  [Run {run}] SPACE accepted + GO!")
+                    except ClockSyncError:
+                        clock_reader.discard_pending_events()
+                        sync_jump = clock_reader.wait_for_running_clock(
+                            args.no_space_sync_timeout_ms / 1000.0,
+                            max_time_ms=clock_anchor_limit_ms,
+                        )
+                        print(
+                            f"  [Run {run}] SPACE not accepted; continuing from "
+                            f"lazer {sync_jump.time_ms:.1f}ms"
+                        )
+                else:
+                    sync_jump = running_sample
+                    print(
+                        f"  [Run {run}] No opening skip needed; continuing from "
+                        f"lazer {sync_jump.time_ms:.1f}ms"
+                    )
+                mabs(center_ax, center_ay)
 
         ks={k:False for k in ['k1','k2']}
         sync_start_index = 0
@@ -402,7 +475,7 @@ def main():
                 if previous_mask & bit:
                     kkey(vk, True)
                     ks[name] = True
-            label = "SPACE accepted" if args.send_space else "gameplay clock synced"
+            label = "SPACE accepted" if space_accepted else "gameplay clock synced"
             print(f"  [Run {run}] {label} at lazer {sync_jump.time_ms:.1f}ms; "
                   f"starting frame {sync_start_index}/{len(frames)}")
             cnt = sync_start_index
@@ -439,7 +512,7 @@ def main():
                 else:
                     dt = frame.time_delta / speed
 
-                if args.send_space and sync_jump is None and dt > 1000 and not first_key_pressed:
+                if (args.send_space is True or send_space_fallback) and sync_jump is None and dt > 1000 and not first_key_pressed:
                     # SKIP long pauses entirely - don't wait
                     skipped_ms += dt
                     et += dt

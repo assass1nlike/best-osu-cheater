@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="multiplier applied to the second replay's dynamic blend weight",
     )
     synthesize.add_argument(
+        "--synthesis-seed",
+        type=int,
+        default=None,
+        help="optional seed for reproducible synthesis randomness",
+    )
+    synthesize.add_argument(
         "--allow-key-mismatch",
         action="store_true",
         help="pair only matching key intervals when source interval counts differ",
@@ -138,8 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     synthesize.add_argument(
         "--greedy-match",
+        "--any-order-match",
         action="store_true",
-        help="use greedy matching instead of the default sequential matching",
+        help="use osu!lazer AnyOrder matching instead of the default Legacy matching",
     )
     add_debug_video_arguments(synthesize)
     download_synthesize = subparsers.add_parser(
@@ -172,6 +179,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="multiplier applied to the second replay's dynamic blend weight",
+    )
+    download_synthesize.add_argument(
+        "--synthesis-seed",
+        type=int,
+        default=None,
+        help="optional seed for reproducible synthesis randomness",
     )
     download_synthesize.add_argument(
         "--mods",
@@ -255,15 +268,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     download_synthesize.add_argument(
         "--greedy-match",
+        "--any-order-match",
         action="store_true",
-        help="use greedy matching instead of the default sequential matching",
+        help="use osu!lazer AnyOrder matching instead of the default Legacy matching",
     )
     add_debug_video_arguments(download_synthesize)
     batch_dt = subparsers.add_parser(
         "batch-dt",
-        help="search recent ranked osu! beatmaps and synthesize a batch of DT replays",
+        help="randomly select ranked osu! beatmaps and synthesize a batch of DT replays",
     )
     batch_dt.add_argument("count", type=int, help="number of synthesized replays to create")
+    batch_dt.add_argument(
+        "--beatmap-selection",
+        choices=("recent", "random-all"),
+        default="random-all",
+        help="beatmap candidate selection: random-all (default) or recent age-filtered results",
+    )
     batch_dt.add_argument(
         "--output-dir",
         type=Path,
@@ -297,13 +317,13 @@ def build_parser() -> argparse.ArgumentParser:
     batch_dt.add_argument(
         "--min-skip-time",
         type=int,
-        default=4000,
-        help="minimum first hit object time in ms for skip-ready beatmaps; 0 disables the filter (default: 4000)",
+        default=0,
+        help="minimum first hit object time in ms; 0 disables the filter (default: 0)",
     )
     batch_dt.add_argument(
         "--no-skip-filter",
         action="store_true",
-        help="include beatmaps even when the first note is too early for stable skip-intro playback",
+        help="force-disable the short-intro filter (the default)",
     )
     batch_dt.add_argument(
         "--spinner-library",
@@ -331,8 +351,16 @@ def build_parser() -> argparse.ArgumentParser:
     batch_dt.add_argument(
         "--search-pages-limit",
         type=int,
-        default=25,
-        help="maximum beatmapset search pages to scan; defaults to 25",
+        default=None,
+        help="maximum ranked search pages in recent mode; defaults to 25 (ignored by random-all)",
+    )
+    batch_dt.add_argument(
+        "--random-search-pages",
+        "--random-id-batches",
+        dest="random_search_pages",
+        type=int,
+        default=None,
+        help="maximum consecutive ranked search pages after a random start page (API pages 1-200); defaults to 200",
     )
     batch_dt.add_argument(
         "--leaderboard-limit",
@@ -350,7 +378,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--random-seed",
         type=int,
         default=None,
-        help="optional seed for replay-pair selection",
+        help="optional seed for random ranked-time pages and replay-pair selection",
+    )
+    batch_dt.add_argument(
+        "--synthesis-seed",
+        type=int,
+        default=None,
+        help="optional seed for reproducible synthesis randomness",
     )
     batch_dt.add_argument(
         "--lazer-storage",
@@ -467,6 +501,7 @@ def synthesize_command(args: argparse.Namespace) -> int:
         player_name=args.player_name,
         first_weight=args.first_weight,
         second_weight=args.second_weight,
+        synthesis_seed=args.synthesis_seed,
         allow_key_mismatch=args.allow_key_mismatch,
         first_skip_ms=args.first_skip_ms,
         second_skip_ms=args.second_skip_ms,
@@ -556,6 +591,7 @@ def download_synthesize_command(args: argparse.Namespace) -> int:
         player_name=args.player_name,
         first_weight=args.first_weight,
         second_weight=args.second_weight,
+        synthesis_seed=args.synthesis_seed,
         scope=args.scope,
         ruleset=args.ruleset,
         mods=args.mods,
@@ -634,6 +670,7 @@ def batch_dt_command(args: argparse.Namespace) -> int:
         args.count,
         output_dir=args.output_dir,
         work_dir=args.work_dir,
+        beatmap_selection=args.beatmap_selection,
         min_age_days=args.min_age_days,
         min_star=args.min_star,
         max_star=args.max_star,
@@ -645,8 +682,10 @@ def batch_dt_command(args: argparse.Namespace) -> int:
         api_version=args.api_version,
         leaderboard_limit=args.leaderboard_limit,
         search_pages_limit=args.search_pages_limit,
+        random_search_pages=args.random_search_pages,
         request_delay_s=args.request_delay_s,
         random_seed=args.random_seed,
+        synthesis_seed=args.synthesis_seed,
         min_skip_time_ms=min_skip_time_ms,
         spinner_library_path=(
             str(args.spinner_library) if (args.spinner_library and args.spinner_mode != "never") else None

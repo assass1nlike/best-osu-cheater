@@ -108,19 +108,24 @@ path can download the sources, synthesize, and render the diagnostic overlay in
 one run. The bundled spinner trajectory library is used automatically; pass
 `--spinner-mode never` to disable spinner trajectory replacement.
 
-To search recent ranked osu!standard beatmapsets and synthesize a batch of DT
-replays:
+To randomly select from all ranked osu!standard difficulties and synthesize a
+batch of DT replays:
 
 ```powershell
 python -m synthesis_osu_play batch-dt 10 --player-name assassinlike
 ```
 
-By default this scans ranked osu! beatmapsets that have been ranked for at least
-3 days, newest first, chooses one osu! difficulty in the 4.5-5.0 star range, and
-writes outputs named by beatmap id to `D:\osu-lazer\exports`. Candidates whose
-first hit object is earlier than 4000 ms are skipped by default because they are
-less suitable for stable automated intro skipping. Use `--no-skip-filter` or
-`--min-skip-time 0` to include them:
+By default this chooses a random starting page from the ranked search API's
+current range of pages 1-200, then searches consecutive pages from that point
+until the requested number of replays has been synthesized. Each request
+returns 50 beatmapsets, from which osu!standard difficulties in the 4.5-5.0
+star range are kept. The search wraps from page 200 to page 1 if necessary.
+`--random-search-pages` can cap the number of consecutive pages; its default is
+200. Outputs are named by beatmap ID and written to
+`D:\osu-lazer\exports`. Short-intro beatmaps are included by default. To use the
+age-filtered newest-first mode instead, pass
+`--beatmap-selection recent --min-age-days 7`. The skip-ready filter remains
+optional; pass `--min-skip-time 4000` to enable it.
 
 The bundled spinner trajectory library is also used automatically for every
 generated DT replay. Pass `--spinner-mode never` to disable spinner trajectory
@@ -143,6 +148,7 @@ Adjust count, age, star range, and output location like this:
 ```powershell
 python -m synthesis_osu_play batch-dt 5 `
   --output-dir D:\osu-lazer\exports `
+  --beatmap-selection recent `
   --min-age-days 7 `
   --min-star 4.8 `
   --max-star 5.3 `
@@ -175,11 +181,30 @@ leaderboard filter when needed.
 Cursor positions are sampled at the union of both replay frame timestamps. Each
 source cursor position is linearly interpolated at that timestamp, then blended
 with dynamic weights. The first replay's base weight follows a 30-second sine
-cycle:
+cycle with one Gaussian-distributed phase offset sampled once per synthesis run:
 
-dynamic_first = 0.5 + 0.5 * sin(pi * (time_ms % 30000) / 15000)
+phase_offset ~ Normal(0, 0.15^2) radians
+dynamic_first = 0.5 + 0.5 * sin(pi * (time_ms % 30000) / 15000 + phase_offset)
 
 The user-provided weights multiply the two dynamic weights before normalization.
+Without `--synthesis-seed`, the phase and each spinner's first-candidate blend
+weight (`U[0.85, 0.95]`) are random for every run. Pass the same
+`--synthesis-seed` to reproduce them and all synthesis-local randomness:
+
+```powershell
+python -m synthesis_osu_play synthesize first.osr second.osr output.osr `
+  --synthesis-seed 123
+```
+
+For `batch-dt`, ranked beatmap difficulties in the star range are selected from
+a consecutive run of ranked search pages beginning at a random page by default.
+`--random-seed` controls the starting page, page order, and which leaderboard
+replays are selected. Use
+`--beatmap-selection recent` with `--min-age-days` to use the age-filtered
+recent-ranking mode instead.
+`--synthesis-seed` controls the random details of each generated replay.
+The batch command derives a separate synthesis seed for each beatmap from the
+base synthesis seed.
 
 All shared cursor, key interval, seed, and skip-boundary averages use the same
 dynamic two-replay weights. The skip intro anchor still keeps the fixed
@@ -197,12 +222,15 @@ This keeps the cursor path continuous through the skip boundary. When `--beatmap
 
 With `--beatmap`, key intervals are matched by hit object:
 
-- first extract all press intervals from both hit keys in each replay
-- mark intervals that hit a circle or slider head within the OD 50 window and CS radius
-- for miss chains, greedily match nearby unused press intervals to the missed object times
+- process press events in replay time order, like osu!lazer's hit policies
+- a press must be inside the largest successful hit window and the actual hit-circle area
+- a misplaced or early press is consumed without removing the object
+- an object is removed only after its successful hit window expires and lazer auto-misses it
+- the default Legacy policy applies note lock; `--any-order-match` selects lazer's AnyOrder policy
+- slider heads use the same hit rule, then slider tracking checks key state and follow-area coverage
 - if either replay has no interval for an object after this process, the synthesized replay does not press that object
 - averaged intervals use legacy `K1` as the primary key. Each synthesis run
-  samples one repeat threshold uniformly from 400-600 ms: after a primary-key
+  samples one repeat threshold uniformly from 300-400 ms: after a primary-key
   note, the next note uses `K1` when its start is more than that threshold later
   and `K2` otherwise; every `K2` note is followed by `K1`
 - if three synthesized intervals overlap at any time, synthesis fails
@@ -270,26 +298,42 @@ latency and connects to tosu (bundled in `tools/tosu/`) to measure hit errors.
 
 ### `replay_bot_enter.py` — ENTER-triggered mode
 
-For beatmaps where a deterministic delay from ENTER to SPACE is needed:
+For a single replay, the default mode automatically handles both beatmaps with
+and without a skippable opening intro:
 
 ```powershell
-python replay_bot_enter.py synth_replay.osr --leadin-time 3000 --speed 1.5
+python replay_bot_enter.py synth_replay.osr --speed 1.5
 ```
 
-After ENTER is pressed, the bot waits `--leadin-time` ms, then presses SPACE.
-The replay starts from the `CurrentTime` observed when lazer accepts that SPACE,
-eliminating both human reaction-time jitter and the old fixed offset search.
+After ENTER is pressed, the bot continuously reads osu!lazer's `CurrentTime`.
+Because lazer also uses this global beatmap clock for song-select previews, the
+bot does not treat the first moving samples as gameplay. It waits for the
+preview clock to stop or rewind during the transition, then requires several
+forward samples from the restarted clock. If the game is still before the
+first replay key, it tries SPACE and starts from the accepted clock jump. If
+SPACE is not accepted, it continues from the current gameplay clock without
+losing synchronization.
 
-For a beatmap without a skip-able intro, use `--no-space`. The bot starts the
-clock reader before waiting for ENTER, discards samples from before ENTER, then
-waits for the gameplay clock to begin moving. It does not send SPACE:
+Use `--space` to force the legacy fixed-delay SPACE behavior, or use
+`--leadin-time` to change its fallback delay:
+
+```powershell
+python replay_bot_enter.py synth_replay.osr `
+  --space `
+  --leadin-time 3000 `
+  --speed 1.5
+```
+
+Use `--no-space` to force the no-space path. The bot starts the clock reader
+before waiting for ENTER, discards samples from before ENTER, then waits for the
+gameplay clock to begin moving:
 
 ```powershell
 python replay_bot_enter.py synth_replay.osr --speed 1.0 --no-space
 ```
 
-The no-space path requires clock sync. It refuses to guess a fixed loading delay
-unless explicitly forced with `--no-space --no-clock-sync --leadin-time 6000`.
+The forced no-space path requires clock sync. With the default automatic mode,
+if clock sync is unavailable the bot falls back to the fixed-delay SPACE path.
 
 The reader is built from the source tree with .NET 8:
 
@@ -298,8 +342,10 @@ dotnet build tools/LazerClockReader/LazerClockReader.csproj -c Release
 ```
 
 The scripts use `tools/LazerClockReader/bin/Release/net8.0/LazerClockReader.exe`
-by default. If the reader cannot attach, they print a warning and fall back to
-the legacy local timer. Use `--no-clock-sync` to select that fallback explicitly.
+by default. In automatic mode, if the reader cannot attach, the bot falls back
+to the fixed-delay SPACE path. Forced `--no-space` requires the reader and exits
+when clock synchronization is unavailable. Use `--no-clock-sync` only when the
+legacy timer fallback is intentional.
 
 ### Config files
 
@@ -329,14 +375,16 @@ manual playfield ratio parameter.
 |-----------|---------|-------------|
 | `--advance` | 0 | Optional residual input timing advance in ms |
 | `--speed` | 1.0 | Playback speed (1.5 for DT, 0.75 for HT) |
-| `--clock-sync` | on | Synchronize to the accepted osu!lazer SPACE clock jump |
+| `--clock-sync` | on | Read osu!lazer `CurrentTime` for automatic start and SPACE synchronization |
 | `--no-clock-sync` | off | Disable live clock reading and use the legacy timer |
 | `--clock-reader` | bundled | Override the reader executable or DLL path |
 | `--clock-sync-timeout-ms` | 5000 | Reader startup and SPACE acceptance timeout |
 | `--clock-jump-threshold-ms` | 100 | Minimum positive `CurrentTime` jump to accept |
-| `--no-space` | off | Start from the gameplay clock without sending SPACE |
+| `--space` | auto | Force fixed-delay SPACE mode |
+| `--no-space` | off | Force start from the gameplay clock without sending SPACE |
+| `--leadin-time` | 6000 | Delay used by forced SPACE and automatic fallback modes |
 | `--no-space-sync-timeout-ms` | 15000 | Timeout waiting for the non-skip gameplay clock |
-| `--no-space-min-lead-ms` | 1000 | Required lead time before the first key in no-space mode |
+| `--no-space-min-lead-ms` | 1000 | Early-time window used to reject song-select preview samples |
 | `--k1` / `--k2` | Z / X | Key bindings |
 | `--auto-tune` | off | Enable tosu hit-error monitoring & auto-restart |
 | `--tune-n` | 100 | Hit count before checking mean error |

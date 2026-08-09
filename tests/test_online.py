@@ -26,6 +26,7 @@ from synthesis_osu_play.online import (
     leaderboard_score_at_index,
     parse_lazer_token,
     refresh_lazer_token,
+    search_candidates_from_payload,
     score_at_rank,
     update_ini_value,
 )
@@ -432,8 +433,8 @@ def test_batch_synthesize_dt_writes_beatmap_id_outputs_and_manifest(tmp_path: Pa
         player_name="synthetic",
         request_delay_s=0,
         random_seed=1,
+        random_search_pages=1,
         client=FakeBatchClient(),
-        min_skip_time_ms=0,
     )
 
     output = OsrReplay.read_path(tmp_path / "exports" / "10001.osr")
@@ -444,12 +445,146 @@ def test_batch_synthesize_dt_writes_beatmap_id_outputs_and_manifest(tmp_path: Pa
     assert report.items[0].selection_pool == "supported_random"
     assert report.manifest_path.exists()
     assert (tmp_path / "work" / "10001" / "beatmapset_20001.osz").exists()
+    assert len(tuple((tmp_path / "work").glob("random_search_page_1_p*_*.json"))) == 1
 
 
-def test_import_batch_beatmaps_launches_lazer_with_unique_archives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    work_dir = tmp_path / "work"
+def test_random_batch_starts_at_random_page_and_stops_after_target(tmp_path: Path) -> None:
+    class ConsecutiveBatchClient(FakeBatchClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.search_requests: list[tuple[int, str]] = []
+
+        def search_beatmapsets(self, **kwargs: object) -> dict[str, object]:
+            page = int(kwargs["page"])
+            sort = str(kwargs["sort"])
+            self.search_requests.append((page, sort))
+            return {
+                "beatmapsets": [
+                    {
+                        "id": 20_000 + page,
+                        "title": f"batch map {page}",
+                        "ranked_date": "2026-06-20T00:00:00Z",
+                        "beatmaps": [
+                            {
+                                "id": 10_000 + page,
+                                "mode": "osu",
+                                "difficulty_rating": 5.0,
+                                "version": "Insane",
+                                "checksum": self.map_md5,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    client = ConsecutiveBatchClient()
+
+    report = batch_synthesize_dt(
+        2,
+        output_dir=tmp_path / "exports",
+        work_dir=tmp_path / "work",
+        min_star=4.5,
+        max_star=5.5,
+        request_delay_s=0,
+        random_seed=1,
+        random_search_pages=3,
+        client=client,
+    )
+
+    assert len(report.items) == 2
+    assert len(client.search_requests) == 2
+    assert client.search_requests[0][0] in range(1, 201)
+    assert client.search_requests[1][0] == (client.search_requests[0][0] % 200) + 1
+    assert client.search_requests[0][1] == client.search_requests[1][1]
+
+
+def test_batch_synthesis_filters_recent_pages_before_leaderboard_requests(tmp_path: Path) -> None:
+    class PaginatedBatchClient(FakeBatchClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.search_cursors: list[object] = []
+            self.score_requests: list[int] = []
+
+        def search_beatmapsets(self, **kwargs: object) -> dict[str, object]:
+            cursor = kwargs.get("cursor_string")
+            self.search_cursors.append(cursor)
+            if cursor is None:
+                return {
+                    "beatmapsets": [
+                        {
+                            "id": 20002,
+                            "title": "recent map",
+                            "ranked_date": "2026-08-01T00:00:00Z",
+                            "beatmaps": [
+                                {
+                                    "id": 10002,
+                                    "mode": "osu",
+                                    "difficulty_rating": 5.0,
+                                    "version": "Insane",
+                                }
+                            ],
+                        }
+                    ],
+                    "cursor_string": "page-2",
+                }
+            return super().search_beatmapsets(**kwargs)
+
+        def get_scores(self, beatmap_id: int, **kwargs: object) -> dict[str, object]:
+            self.score_requests.append(beatmap_id)
+            return super().get_scores(beatmap_id, **kwargs)
+
+    client = PaginatedBatchClient()
+
+    report = batch_synthesize_dt(
+        1,
+        output_dir=tmp_path / "exports",
+        work_dir=tmp_path / "work",
+        beatmap_selection="recent",
+        min_age_days=20,
+        min_star=4.5,
+        max_star=5.5,
+        request_delay_s=0,
+        client=client,
+    )
+
+    assert report.items[0].beatmap_id == 10001
+    assert client.search_cursors == [None, "page-2"]
+    assert client.score_requests == [10001]
+
+
+def test_search_candidates_random_all_keeps_every_eligible_difficulty() -> None:
+    payload = {
+        "beatmapsets": [
+            {
+                "id": 20001,
+                "title": "set",
+                "ranked_date": "2026-06-20T00:00:00Z",
+                "beatmaps": [
+                    {"id": 10001, "mode": "osu", "difficulty_rating": 4.6, "version": "Hard"},
+                    {"id": 10002, "mode": "osu", "difficulty_rating": 4.9, "version": "Insane"},
+                    {"id": 10003, "mode": "osu", "difficulty_rating": 5.4, "version": "Expert"},
+                ],
+            }
+        ]
+    }
+
+    recent = search_candidates_from_payload(payload, min_star=4.5, max_star=5.0)
+    random_all = search_candidates_from_payload(
+        payload,
+        min_star=4.5,
+        max_star=5.0,
+        all_eligible_difficulties=True,
+    )
+
+    assert [candidate.beatmap_id for candidate in recent] == [10002]
+    assert [candidate.beatmap_id for candidate in random_all] == [10001, 10002]
+
+
+def test_import_batch_beatmaps_launches_lazer_once_with_all_archives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    work_dir = Path("work")
     first_archive = work_dir / "123" / "beatmapset_456.osz"
-    second_archive = work_dir / "456" / "beatmapset_456.osz"
+    second_archive = work_dir / "456" / "beatmapset_789.osz"
     first_archive.parent.mkdir(parents=True)
     second_archive.parent.mkdir(parents=True)
     first_archive.write_bytes(b"first")
@@ -481,7 +616,7 @@ def test_import_batch_beatmaps_launches_lazer_with_unique_archives(tmp_path: Pat
                 index=2,
                 output_path=tmp_path / "exports" / "456.osr",
                 beatmap_id=456,
-                beatmapset_id=456,
+                beatmapset_id=789,
                 difficulty_rating=5.0,
                 title="title",
                 version="diff",
@@ -510,11 +645,12 @@ def test_import_batch_beatmaps_launches_lazer_with_unique_archives(tmp_path: Pat
 
     monkeypatch.setattr("synthesis_osu_play.online.subprocess.Popen", fake_popen)
 
-    assert batch_beatmap_archive_paths(report) == (first_archive,)
+    expected_archives = (first_archive.resolve(), second_archive.resolve())
+    assert batch_beatmap_archive_paths(report) == expected_archives
 
     imported = import_batch_beatmaps(report, lazer_path=lazer_dir)
 
-    assert imported == (first_archive,)
+    assert imported == expected_archives
     assert seen["command"][0] == str(lazer_dir / "osu!.exe")
-    assert seen["command"][1:] == [str(first_archive)]
+    assert seen["command"][1:] == [str(path) for path in expected_archives]
     assert seen["kwargs"]["cwd"] == str(lazer_dir)

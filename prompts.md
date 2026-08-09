@@ -173,6 +173,10 @@
 
 合成使用的原料回放如果不是NM，使用的mod只能是 difficulty reduction中的mod(EZ,NF,HT,DC)/difficulty increase中的mod(HR,SD,PF,DT,NC,HD,TC,FL,BL,ST,AC)/classic 以及它们的组合。在这些之中（事实上绝大多数排行榜上的回放一定都会满足的），随机选择两个。
 
+---
+
+
+
 # Auxillary
 
 ## Debug
