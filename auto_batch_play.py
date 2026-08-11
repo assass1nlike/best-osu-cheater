@@ -6,7 +6,7 @@ Usage:
                             [--leadin-time 6000] [--advance 0]
                             [--tune-n 30] [--tune-threshold 10]
                             [--tune-n2 150] [--tune-threshold2 5]
-                            [--speed 1.5] [--k1 Z] [--k2 X]
+                            [--speed 1.5] [--hr] [--k1 Z] [--k2 X]
                             [--skip 1 5]
                             [--post-enter-wait-s 0]
                             [--startup-wait-s 3]
@@ -17,6 +17,13 @@ Usage:
 import ctypes, time, sys, argparse, subprocess, json, random, urllib.request
 from ctypes import wintypes, byref, sizeof, Structure, Union
 from pathlib import Path
+from osrparse import Replay
+from synthesis_osu_play.replay_quality import (
+    SPARSE_MOVEMENT_ERROR_COUNT,
+    SPARSE_MOVEMENT_MAX_GAP_MS,
+    SPARSE_MOVEMENT_MIN_GAP_MS,
+    sparse_movement_gaps,
+)
 
 # ---------------------------------------------------------------------------
 # Windows input (same as replay_bot)
@@ -142,6 +149,8 @@ def main():
     parser.add_argument("--tune-n2", type=int, default=150)
     parser.add_argument("--tune-threshold2", type=float, default=5.0)
     parser.add_argument("--speed", type=float, default=1.5)
+    parser.add_argument("--hr", action="store_true",
+                        help="Vertically flip cursor input for Hard Rock gameplay")
     parser.add_argument("--auto-tune", action="store_true",
                         help="Enable tosu hit-error monitoring and restart tuning")
     parser.add_argument("--k1", default="Z")
@@ -205,7 +214,7 @@ def main():
     print(f"Batch play: {len(items)} beatmaps")
     print(f"  Leadin: {args.leadin_time}ms | Advance: {args.advance}ms")
     print(f"  Tune: {args.tune_n} hits @{args.tune_threshold}ms → {args.tune_n2} hits @{args.tune_threshold2}ms")
-    print(f"  Speed: {args.speed}x | Keys: {args.k1}/{args.k2}")
+    print(f"  Speed: {args.speed}x | HR: {'on' if args.hr else 'off'} | Keys: {args.k1}/{args.k2}")
     if skip_indices:
         print(f"  Skip manifest positions: {', '.join(str(index) for index in sorted(skip_indices))}")
     print(f"{'='*60}")
@@ -296,6 +305,18 @@ def main():
             print(f"\n[{idx+1}/{len(items)}] beatmap {bid}: replay not found ({osr_path}), skip")
             continue
 
+        replay = Replay.from_path(osr_path)
+        sparse_gaps = sparse_movement_gaps(replay.replay_data)
+        if len(sparse_gaps) >= SPARSE_MOVEMENT_ERROR_COUNT:
+            max_gap_ms = max(delta_ms for delta_ms, _distance in sparse_gaps)
+            print(
+                f"\n[{idx+1}/{len(items)}] beatmap {bid}: skipped because replay cursor "
+                f"data has {len(sparse_gaps)} sparse moving gap(s) in "
+                f"{SPARSE_MOVEMENT_MIN_GAP_MS:g}-{SPARSE_MOVEMENT_MAX_GAP_MS:g}ms "
+                f"(largest gap {max_gap_ms:.0f}ms)"
+            )
+            continue
+
         print(f"\n{'='*60}")
         print(f"[{idx+1}/{len(items)}] beatmap {bid}: {item.get('title','?')[:40]} [{item.get('version','?')[:15]}]")
         print(f"  Replay: {osr_path}")
@@ -324,6 +345,8 @@ def main():
         ]
         if args.auto_tune:
             cmd.append("--auto-tune")
+        if args.hr:
+            cmd.append("--hr")
         if args.no_space:
             cmd.append("--no-space")
         if not args.no_clock_sync:

@@ -26,3 +26,10 @@ def test_fullscreen_playfield_maps_center_and_clamps_edges() -> None:
 def test_fullscreen_playfield_rejects_invalid_screen() -> None:
     with pytest.raises(ValueError):
         FullscreenPlayfield.from_screen(0, 1080)
+
+
+def test_fullscreen_playfield_flips_hard_rock_y_coordinate() -> None:
+    playfield = FullscreenPlayfield.from_screen(1920, 1080)
+
+    assert playfield.to_absolute(128, 80, hard_rock=True) == playfield.to_absolute(128, 304)
+    assert playfield.to_absolute(256, 192, hard_rock=True) == playfield.to_absolute(256, 192)

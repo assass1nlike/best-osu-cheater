@@ -256,18 +256,28 @@ python -m synthesis_osu_play finalize provisional.osr scored.osr final.osr --del
 
 The finalize step copies hit counts, score, max combo, perfect flag, rank, and
 statistics from the scored replay while clearing online score identity fields.
+Stock osu!lazer's normal export action for an imported replay copies the
+original stored replay file, so it does not replace this explicit metadata
+rewrite step.
 
-Note that stock osu!lazer's normal export action for an imported replay copies
-the original stored replay file. It does not, by itself, write the replay
-player's freshly recomputed `ScoreInfo` back to a new `.osr`. The `finalize`
-command is the safe metadata-rewrite boundary; a dedicated lazer/headless
-metadata extractor still needs to provide the scored source for full automation.
-
-The local judge is retained only as a legacy debug fallback:
+The Python local judge is retained only as a legacy debug fallback:
 
 ```powershell
 python -m synthesis_osu_play synthesize first.osr second.osr output.osr --beatmap map.osu --local-score
 ```
+
+To perform an authoritative FC check, run the replay through the installed
+osu!lazer engine. This reports official 300/100/50/miss counts and every
+combo-breaking slider head, tick, repeat, or tail judgement:
+
+```powershell
+python -m synthesis_osu_play fc-check output.osr --beatmap map.osu
+```
+
+The command exits with code 0 for an FC and code 1 when it finds a miss or
+slider break. Add `--json fc-report.json` for the full machine-readable report,
+or `--lazer-path D:\path\to\osulazer\current` when auto-detection is not suitable.
+The headless scorer is compiled automatically on first use and requires .NET 8.
 
 This local path is not used for the automated-playback goal and may disagree
 with osu!lazer on edge cases.
@@ -375,6 +385,7 @@ manual playfield ratio parameter.
 |-----------|---------|-------------|
 | `--advance` | 0 | Optional residual input timing advance in ms |
 | `--speed` | 1.0 | Playback speed (1.5 for DT, 0.75 for HT) |
+| `--hr` | off | Vertically flip cursor input for Hard Rock gameplay |
 | `--clock-sync` | on | Read osu!lazer `CurrentTime` for automatic start and SPACE synchronization |
 | `--no-clock-sync` | off | Disable live clock reading and use the legacy timer |
 | `--clock-reader` | bundled | Override the reader executable or DLL path |

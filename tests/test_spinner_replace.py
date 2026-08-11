@@ -11,7 +11,7 @@ from synthesis_osu_play.spinner_replace import (
     search_spinner_trajectories,
     spinner_playback_duration_ms,
 )
-from synthesis_osu_play.synthesis import AbsoluteFrame
+from synthesis_osu_play.synthesis import AbsoluteFrame, to_delta_frames
 
 
 def make_library_spinner(
@@ -211,3 +211,36 @@ def test_replaced_final_spinner_discards_trailing_input(
         replacements[0].blended_trajectory[-1]
     )
     assert all(frame.time_ms <= 3000 for frame in modified)
+
+
+def test_replaced_initial_spinner_discards_leading_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library = [make_library_spinner(2000, rpm=300.0, player="initial-spinner")]
+    monkeypatch.setattr(spinner_module, "_load_library", lambda _path: library)
+    frames = [
+        AbsoluteFrame(time_ms=0, x=100.0, y=50.0, keys=0),
+        AbsoluteFrame(time_ms=500, x=150.0, y=100.0, keys=0),
+        AbsoluteFrame(time_ms=1000, x=320.0, y=192.0, keys=5),
+        AbsoluteFrame(time_ms=3000, x=320.0, y=192.0, keys=0),
+        AbsoluteFrame(time_ms=3500, x=256.0, y=192.0, keys=1),
+    ]
+    spinner = HitObject(0, 256.0, 192.0, 1000, 8, end_time_ms=3000)
+    circle = HitObject(1, 256.0, 192.0, 3500, 1)
+
+    modified, replacements = replace_spinner_segments(
+        frames,
+        [spinner, circle],
+        [(1000, 3000)],
+        spinner_mode="all",
+    )
+
+    assert len(replacements) == 1
+    assert modified[0].time_ms == 1000
+    assert modified[0].keys == 5
+    assert (modified[0].x, modified[0].y) == pytest.approx(
+        replacements[0].blended_trajectory[0]
+    )
+    assert all(frame.time_ms >= 1000 for frame in modified)
+    assert modified[-1].time_ms == 3500
+    assert to_delta_frames(modified)[0].delta_ms == 1000
