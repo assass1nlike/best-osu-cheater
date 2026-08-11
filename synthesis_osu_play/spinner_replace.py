@@ -565,12 +565,67 @@ def replace_spinner_segments(
 
     # Build modified frames
     modified = _apply_replacements(absolute_frames, replacements)
+    modified = _start_at_replaced_initial_spinner(
+        modified,
+        hit_objects,
+        replacements,
+    )
     modified = _stop_after_replaced_final_spinner(
         modified,
         hit_objects,
         replacements,
     )
     return modified, replacements
+
+
+def _start_at_replaced_initial_spinner(
+    frames: list[AbsoluteFrame],
+    hit_objects: list,
+    replacements: list[SpinnerReplacement],
+) -> list[AbsoluteFrame]:
+    """Discard input before a replaced spinner when it is the first object."""
+    if not frames or not hit_objects:
+        return frames
+
+    initial_object = hit_objects[0]
+    if not initial_object.is_spinner:
+        return frames
+
+    initial_start_ms = initial_object.time_ms
+    initial_end_ms = initial_object.resolved_end_time_ms
+    replacement = next(
+        (
+            item
+            for item in replacements
+            if item.start_ms == initial_start_ms and item.end_ms == initial_end_ms
+        ),
+        None,
+    )
+    if replacement is None or not replacement.blended_trajectory:
+        return frames
+
+    initial_x, initial_y = replacement.blended_trajectory[0]
+    start_frame = next(
+        (frame for frame in frames if frame.time_ms == initial_start_ms),
+        None,
+    )
+    initial_keys = start_frame.keys if start_frame is not None else 0
+    discarded_count = sum(frame.time_ms < initial_start_ms for frame in frames)
+    trimmed = [
+        AbsoluteFrame(
+            time_ms=initial_start_ms,
+            x=initial_x,
+            y=initial_y,
+            keys=initial_keys,
+        ),
+        *(frame for frame in frames if frame.time_ms > initial_start_ms),
+    ]
+    LOGGER.info(
+        "initial spinner starts at %sms; discarded %s leading replay frame(s)",
+        initial_start_ms,
+        discarded_count,
+    )
+    return trimmed
 
 
 def _stop_after_replaced_final_spinner(

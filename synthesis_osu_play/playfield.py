@@ -53,7 +53,15 @@ class FullscreenPlayfield:
     def height(self) -> float:
         return OSU_PLAYFIELD_HEIGHT * self.scale
 
-    def to_absolute(self, osu_x: float, osu_y: float) -> tuple[int, int]:
+    def to_absolute(
+        self,
+        osu_x: float,
+        osu_y: float,
+        *,
+        hard_rock: bool = False,
+    ) -> tuple[int, int]:
+        if hard_rock:
+            osu_y = OSU_PLAYFIELD_HEIGHT - osu_y
         screen_x = self.left + osu_x * self.scale
         screen_y = self.top + osu_y * self.scale
         absolute_x = round(screen_x * ABSOLUTE_COORDINATE_MAX / max(self.screen_width - 1, 1))

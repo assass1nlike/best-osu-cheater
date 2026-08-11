@@ -3,9 +3,10 @@ Replay Bot (ENTER variant) - ENTER triggers automatic clock-aligned playback.
 By default it detects whether the opening intro can be skipped with SPACE.
 
 Usage:
-  python replay_bot_enter.py <replay.osr> [--advance 0] [--speed 1.0] ...
+  python replay_bot_enter.py <replay.osr> [--advance 0] [--speed 1.0] [--hr] ...
 """
 import ctypes, time, sys, argparse, json, threading, os, subprocess, urllib.request
+from bisect import bisect_right
 from ctypes import wintypes, byref, sizeof, Structure, Union
 from osrparse import Replay
 from lazer_clock_sync import (
@@ -16,6 +17,12 @@ from lazer_clock_sync import (
     window_process_id,
 )
 from synthesis_osu_play.playfield import FullscreenPlayfield
+from synthesis_osu_play.replay_quality import (
+    SPARSE_MOVEMENT_ERROR_COUNT,
+    SPARSE_MOVEMENT_MAX_GAP_MS,
+    SPARSE_MOVEMENT_MIN_GAP_MS,
+    sparse_movement_gaps,
+)
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -23,7 +30,7 @@ except:
     ctypes.windll.user32.SetProcessDPIAware()
 
 IM, IK = 0, 1
-MF_M, MF_A = 0x0001, 0x8000
+MF_M, MF_NC, MF_A = 0x0001, 0x2000, 0x8000
 MF_LD, MF_LU = 0x0002, 0x0004
 MF_RD, MF_RU = 0x0008, 0x0010
 KF_UP = 0x0002
@@ -32,11 +39,71 @@ VK_Z, VK_X, VK_SPACE, VK_F7, VK_ESC, VK_RETURN = 0x5A, 0x58, 0x20, 0x76, 0x1B, 0
 KM1, KM2, KK1, KK2 = 1, 2, 4, 8
 LAZER_MINIMUM_SKIP_TIME_MS = 1000.0
 AUTO_SPACE_EXTRA_LEAD_MS = 1000.0
+DEFAULT_CURSOR_PREPOSITION_MS = 0.0
+DEFAULT_CURSOR_SETTLE_MS = 18.0
 
 def should_try_auto_space(current_time_ms, first_key_time_ms, extra_lead_ms=AUTO_SPACE_EXTRA_LEAD_MS):
     if first_key_time_ms is None:
         return False
     return first_key_time_ms - current_time_ms >= LAZER_MINIMUM_SKIP_TIME_MS + extra_lead_ms
+
+def preposition_cursor_positions(frames, frame_times_ms, lead_ms, settle_ms):
+    """Reach each key-down position early, then hold it long enough for lazer to sample."""
+    if len(frames) != len(frame_times_ms):
+        raise ValueError("frames and frame times must have the same length")
+    if lead_ms < 0:
+        raise ValueError("cursor pre-position time must be non-negative")
+    if settle_ms < 0 or settle_ms > lead_ms:
+        raise ValueError("cursor settle time must be between zero and the pre-position time")
+
+    press_frames = [False] * len(frames)
+    previous_keys = 0
+    for index, frame in enumerate(frames):
+        current_keys = int(frame.keys) & (KK1 | KK2)
+        if frame.time_delta >= 0:
+            press_frames[index] = bool(current_keys & ~previous_keys)
+        previous_keys = current_keys
+
+    positions = [(float(frame.x), float(frame.y)) for frame in frames]
+    next_press_index = None
+    for index in range(len(frames) - 1, -1, -1):
+        if press_frames[index]:
+            next_press_index = index
+        if next_press_index is None:
+            continue
+        time_until_press = frame_times_ms[next_press_index] - frame_times_ms[index]
+        if 0 <= time_until_press <= lead_ms:
+            target = frames[next_press_index]
+            if time_until_press <= settle_ms or lead_ms == settle_ms:
+                positions[index] = (float(target.x), float(target.y))
+                continue
+
+            window_start_ms = frame_times_ms[next_press_index] - lead_ms
+            progress = (lead_ms - time_until_press) / (lead_ms - settle_ms)
+            source_time_ms = window_start_ms + progress * lead_ms
+            right_index = bisect_right(
+                frame_times_ms,
+                source_time_ms,
+                lo=index,
+                hi=next_press_index + 1,
+            )
+            left_index = max(index, min(right_index - 1, next_press_index))
+            if left_index >= next_press_index:
+                positions[index] = (float(target.x), float(target.y))
+                continue
+            left_time_ms = frame_times_ms[left_index]
+            right_time_ms = frame_times_ms[left_index + 1]
+            if right_time_ms <= left_time_ms:
+                positions[index] = (float(frames[left_index].x), float(frames[left_index].y))
+                continue
+            ratio = (source_time_ms - left_time_ms) / (right_time_ms - left_time_ms)
+            left = frames[left_index]
+            right = frames[left_index + 1]
+            positions[index] = (
+                float(left.x) + (float(right.x) - float(left.x)) * ratio,
+                float(left.y) + (float(right.y) - float(left.y)) * ratio,
+            )
+    return tuple(positions)
 
 class MI(Structure):
     _fields_=[("dx",wintypes.LONG),("dy",wintypes.LONG),("md",wintypes.DWORD),
@@ -49,9 +116,23 @@ class IU(Union):
 class IN(Structure):
     _fields_=[("tp",wintypes.DWORD),("u",IU)]
 
-def mabs(x,y):
+def _mouse_move_input(x,y):
     i=IN(tp=IM); i.u.mi.dx=int(x); i.u.mi.dy=int(y)
-    i.u.mi.fl=MF_M|MF_A; ctypes.windll.user32.SendInput(1,byref(i),sizeof(i))
+    i.u.mi.fl=MF_M|MF_NC|MF_A
+    return i
+
+def _keyboard_input(vk,down):
+    i=IN(tp=IK); i.u.ki.vk=vk
+    i.u.ki.sc = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+    i.u.ki.fl = KF_SCANCODE if down else (KF_SCANCODE | KF_UP)
+    return i
+
+def _send_inputs(inputs):
+    batch=(IN*len(inputs))(*inputs)
+    return ctypes.windll.user32.SendInput(len(batch),batch,sizeof(IN))
+
+def mabs(x,y):
+    _send_inputs([_mouse_move_input(x,y)])
 
 def mbtn(down,left=True):
     i=IN(tp=IM)
@@ -63,10 +144,13 @@ WM_KEYUP = 0x0101
 
 def kkey(vk,down):
     """Send keyboard via SendInput with scan code."""
-    i=IN(tp=IK); i.u.ki.vk=vk
-    i.u.ki.sc = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
-    i.u.ki.fl = KF_SCANCODE if down else (KF_SCANCODE | KF_UP)
-    ctypes.windll.user32.SendInput(1,byref(i),sizeof(i))
+    _send_inputs([_keyboard_input(vk,down)])
+
+def send_frame_input(x,y,key_events):
+    """Submit a frame's cursor and key changes as one ordered Windows input batch."""
+    inputs=[_mouse_move_input(x,y)]
+    inputs.extend(_keyboard_input(vk,down) for vk,down in key_events)
+    _send_inputs(inputs)
 
 def kdown(vk):
     return ctypes.windll.user32.GetAsyncKeyState(vk)&0x8000
@@ -159,6 +243,10 @@ def main():
                         help='skip waiting for ENTER (caller already pressed it)')
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Playback speed multiplier (e.g. 1.5 for DT, 0.75 for HT)')
+    parser.add_argument('--cursor-preposition-ms', type=float, default=DEFAULT_CURSOR_PREPOSITION_MS,
+                        help='Real ms to begin approaching an upcoming key-down position (default: 0; disabled)')
+    parser.add_argument('--hr', action='store_true',
+                        help='Vertically flip cursor input for Hard Rock gameplay')
     parser.add_argument('--clock-sync', dest='clock_sync', action='store_true', default=True,
                         help='Align replay to the accepted SPACE clock jump (default)')
     parser.add_argument('--no-clock-sync', dest='clock_sync', action='store_false',
@@ -203,6 +291,11 @@ def main():
         if 'replay' in cfg:
             args.replay = cfg['replay']
 
+    if args.speed <= 0:
+        parser.error('--speed must be positive')
+    if args.cursor_preposition_ms < 0:
+        parser.error('--cursor-preposition-ms must be non-negative')
+
     # Map key names to VK codes
     keymap = {chr(c): c for c in range(0x41, 0x5B)}  # A-Z
     k1_vk = keymap.get(args.k1.upper(), 0x5A)
@@ -211,7 +304,7 @@ def main():
     print("="*55)
     print("  osu!lazer Replay Bot")
     print(f"  Replay: {args.replay}")
-    print(f"  Keys: {args.k1}/{args.k2} | Advance={args.advance}ms")
+    print(f"  Keys: {args.k1}/{args.k2} | Advance={args.advance}ms | HR={'on' if args.hr else 'off'}")
     print("="*55)
 
     hwnd,rect,title = find_osu()
@@ -233,7 +326,28 @@ def main():
 
     r=Replay.from_path(args.replay)
     frames=r.replay_data
+    sparse_gaps = sparse_movement_gaps(frames)
+    if len(sparse_gaps) >= SPARSE_MOVEMENT_ERROR_COUNT:
+        max_gap_ms = max(delta_ms for delta_ms, _distance in sparse_gaps)
+        max_distance = max(distance for _delta_ms, distance in sparse_gaps)
+        print(
+            "  ERROR: replay cursor data is too sparse for direct playback: "
+            f"{len(sparse_gaps)} moving gap(s) in "
+            f"{SPARSE_MOVEMENT_MIN_GAP_MS:g}-{SPARSE_MOVEMENT_MAX_GAP_MS:g}ms "
+            f"(largest gap {max_gap_ms:.0f}ms, largest move {max_distance:.1f} osu units)."
+        )
+        print(
+            "  Refusing to play because replay_bot_enter does not interpolate "
+            "between sparse cursor frames."
+        )
+        sys.exit(1)
     timeline = ReplayTimeline.from_frames(frames)
+    cursor_positions = preposition_cursor_positions(
+        frames,
+        timeline.frame_times_ms,
+        args.cursor_preposition_ms * speed,
+        min(args.cursor_preposition_ms, DEFAULT_CURSOR_SETTLE_MS) * speed,
+    )
     first_key_time_ms = timeline.first_key_time_ms(frames)
     clock_anchor_limit_ms = None
     if first_key_time_ms is not None:
@@ -242,6 +356,11 @@ def main():
     skipped=sum(f.time_delta for f in frames if f.time_delta>1000) / speed
 
     print(f"  leadin: {args.leadin_time}ms | advance: {ADVANCE_MS}ms | speed: {speed}x")
+    cursor_settle_ms = min(args.cursor_preposition_ms, DEFAULT_CURSOR_SETTLE_MS)
+    print(
+        f"  Cursor pre-position: {args.cursor_preposition_ms:g}ms "
+        f"({cursor_settle_ms:g}ms settled)"
+    )
     space_mode = 'auto' if args.send_space is None else ('on' if args.send_space else 'off')
     print(f"  SPACE mode: {space_mode}")
     if args.clock_sync:
@@ -261,7 +380,7 @@ def main():
           f"at ({playfield.left:.1f}, {playfield.top:.1f}) | Scale: {playfield.scale:.4f}")
 
     def map_osu(osu_x, osu_y):
-        return playfield.to_absolute(osu_x, osu_y)
+        return playfield.to_absolute(osu_x, osu_y, hard_rock=args.hr)
 
     center_ax, center_ay = map_osu(256, 192)
 
@@ -469,8 +588,8 @@ def main():
             sync_start_index = min(sync_start_index, len(frames))
             previous_mask = initial_key_mask(frames, sync_start_index)
             if sync_start_index > 0:
-                previous_frame = frames[sync_start_index - 1]
-                mabs(*map_osu(previous_frame.x, previous_frame.y))
+                previous_x, previous_y = cursor_positions[sync_start_index - 1]
+                mabs(*map_osu(previous_x, previous_y))
             for bit,name,vk in [(KK1,'k1',k1_vk),(KK2,'k2',k2_vk)]:
                 if previous_mask & bit:
                     kkey(vk, True)
@@ -492,6 +611,7 @@ def main():
         try:
             for frame_index, frame in enumerate(frames):
                 if kdown(VK_F7): print("\n  F7 ABORT (exit=1)"); sys.exit(1)
+                cursor_x, cursor_y = cursor_positions[frame_index]
 
                 if sync_jump is not None:
                     if frame_index < sync_start_index:
@@ -506,8 +626,7 @@ def main():
                         while time.perf_counter() < target:
                             pass
 
-                    ax,ay = map_osu(frame.x, frame.y)
-                    mabs(ax, ay)
+                    ax,ay = map_osu(cursor_x, cursor_y)
                     dt = 0
                 else:
                     dt = frame.time_delta / speed
@@ -516,8 +635,7 @@ def main():
                     # SKIP long pauses entirely - don't wait
                     skipped_ms += dt
                     et += dt
-                    ax,ay = map_osu(frame.x, frame.y)
-                    mabs(ax, ay)
+                    ax,ay = map_osu(cursor_x, cursor_y)
                 else:
                     # Normal frame timing
                     if dt > 0:
@@ -531,18 +649,18 @@ def main():
                                 pass
 
                     if sync_jump is None:
-                        ax,ay = map_osu(frame.x, frame.y)
-                        mabs(ax, ay)
+                        ax,ay = map_osu(cursor_x, cursor_y)
 
-                # Keyboard only via PostMessage (bypasses raw input)
                 k = frame.keys
+                key_events = []
                 for bit,name,vk in [(KK1,'k1',k1_vk),(KK2,'k2',k2_vk)]:
                     d = bool(k&bit)
                     if d != ks[name]:
-                        kkey(vk, d)
+                        key_events.append((vk, d))
                         if d and not first_key_pressed:
                             first_key_pressed = True
                         ks[name] = d
+                send_frame_input(ax, ay, key_events)
                 cnt += 1
 
                 # Fail detection via HP drop

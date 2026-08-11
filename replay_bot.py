@@ -149,6 +149,8 @@ def main():
                         help='Delay after trigger in normal mode (ms, default: 500)')
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Playback speed multiplier (e.g. 1.5 for DT, 0.75 for HT)')
+    parser.add_argument('--hr', action='store_true',
+                        help='Vertically flip cursor input for Hard Rock gameplay')
     parser.add_argument('--clock-sync', dest='clock_sync', action='store_true', default=True,
                         help='Align replay to the accepted SPACE clock jump (default)')
     parser.add_argument('--no-clock-sync', dest='clock_sync', action='store_false',
@@ -197,7 +199,7 @@ def main():
     print("="*55)
     print("  osu!lazer Replay Bot")
     print(f"  Replay: {args.replay}")
-    print(f"  Keys: {args.k1}/{args.k2} | Advance={args.advance}ms")
+    print(f"  Keys: {args.k1}/{args.k2} | Advance={args.advance}ms | HR={'on' if args.hr else 'off'}")
     print("="*55)
 
     hwnd,rect,title = find_osu()
@@ -246,7 +248,7 @@ def main():
           f"at ({playfield.left:.1f}, {playfield.top:.1f}) | Scale: {playfield.scale:.4f}")
 
     def map_osu(osu_x, osu_y):
-        return playfield.to_absolute(osu_x, osu_y)
+        return playfield.to_absolute(osu_x, osu_y, hard_rock=args.hr)
 
     center_ax, center_ay = map_osu(256, 192)
 

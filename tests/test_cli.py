@@ -5,6 +5,7 @@ import pytest
 
 import synthesis_osu_play.cli as cli_module
 from synthesis_osu_play.cli import main
+from synthesis_osu_play.lazer_scoring import JudgementIssue, LazerScoreReport
 from synthesis_osu_play.online import BatchSynthesisItem, BatchSynthesisReport, LeaderboardScore, OnlineSynthesisReport
 from synthesis_osu_play.osr import OsrReplay, ReplayFrame, encode_lazer_replay_metadata
 from synthesis_osu_play.synthesis import LEGACY_Z_KEY, SynthesisReport, effective_weights
@@ -77,6 +78,18 @@ def test_parser_exposes_playback_controls(tmp_path: Path) -> None:
     ])
     assert download.lazer_path == tmp_path / "lazer"
     assert download.synthesis_seed == 8
+
+    fc_check = parser.parse_args([
+        "fc-check",
+        "replay.osr",
+        "--beatmap",
+        "map.osu",
+        "--lazer-path",
+        str(tmp_path / "lazer"),
+    ])
+    assert fc_check.replay == Path("replay.osr")
+    assert fc_check.beatmap == Path("map.osu")
+    assert fc_check.lazer_path == tmp_path / "lazer"
 
 
 def test_synthesize_command_writes_readable_osr(tmp_path: Path) -> None:
@@ -383,3 +396,75 @@ def test_finalize_command_copies_scored_metadata(tmp_path: Path) -> None:
     assert output.count_300 == 1
     assert output.count_miss == 1
     assert output.score == 1234
+
+
+def test_fc_check_command_reports_fc(tmp_path: Path, monkeypatch, capsys) -> None:
+    report = LazerScoreReport(
+        is_fc=True,
+        score=1_000_000,
+        max_combo=100,
+        maximum_combo=100,
+        rank="X",
+        accuracy=1.0,
+        passed=True,
+        count_300=80,
+        count_100=0,
+        count_50=0,
+        count_miss=0,
+        statistics={"great": 80},
+        slider_breaks=(),
+        other_combo_breaks=(),
+    )
+    monkeypatch.setattr(cli_module, "score_replay_with_lazer", lambda *args, **kwargs: report)
+
+    exit_code = main(["fc-check", "replay.osr", "--beatmap", "map.osu"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "FC: YES" in output
+    assert "300/100/50/miss: 80/0/0/0" in output
+    assert "combo: 100/100" in output
+
+
+def test_fc_check_command_reports_slider_break_and_writes_json(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    issue = JudgementIssue(
+        slider_part="tick",
+        hit_object_type="SliderTick",
+        result="LargeTickMiss",
+        object_time_ms=1234.5,
+        judgement_time_ms=1234.5,
+        time_offset_ms=0.0,
+        combo_before=12,
+        combo_after=0,
+    )
+    report = LazerScoreReport(
+        is_fc=False,
+        score=900_000,
+        max_combo=50,
+        maximum_combo=100,
+        rank="A",
+        accuracy=0.97,
+        passed=True,
+        count_300=79,
+        count_100=1,
+        count_50=0,
+        count_miss=0,
+        statistics={"great": 79, "ok": 1, "large_tick_miss": 1},
+        slider_breaks=(issue,),
+        other_combo_breaks=(),
+    )
+    monkeypatch.setattr(cli_module, "score_replay_with_lazer", lambda *args, **kwargs: report)
+    json_path = tmp_path / "reports" / "fc.json"
+
+    exit_code = main(
+        ["fc-check", "replay.osr", "--beatmap", "map.osu", "--json", str(json_path)]
+    )
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "FC: NO" in output
+    assert "1234.5ms tick: LargeTickMiss" in output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["slider_breaks"][0]["slider_part"] == "tick"

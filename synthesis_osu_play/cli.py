@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from .beatmap import Beatmap, BeatmapFormatError
 from .finalize import ReplayFinalizeError, finalize_replay_file
 from .lazer import replay_to_lazer_export, write_lazer_json
+from .lazer_scoring import LazerScoringError, score_replay_with_lazer
 from .online import (
     DEFAULT_BATCH_OUTPUT_DIR,
     DEFAULT_BATCH_WORK_DIR,
@@ -41,7 +43,17 @@ def main(argv: list[str] | None = None) -> int:
             return batch_dt_command(args)
         if args.command == "finalize":
             return finalize_command(args)
-    except (OSError, BeatmapFormatError, OsrFormatError, OnlineSynthesisError, ReplayFinalizeError, SynthesisError) as exc:
+        if args.command == "fc-check":
+            return fc_check_command(args)
+    except (
+        OSError,
+        BeatmapFormatError,
+        OsrFormatError,
+        OnlineSynthesisError,
+        ReplayFinalizeError,
+        SynthesisError,
+        LazerScoringError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     parser.error("missing command")
@@ -443,6 +455,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow metadata copy even if replay frames differ; beatmap and mods are still checked",
     )
+    fc_check = subparsers.add_parser(
+        "fc-check",
+        help="check a replay for misses and slider breaks using the installed osu!lazer engine",
+    )
+    fc_check.add_argument("replay", type=Path, help="replay .osr to check")
+    fc_check.add_argument("--beatmap", type=Path, required=True, help="matching .osu beatmap")
+    fc_check.add_argument(
+        "--lazer-path",
+        type=Path,
+        default=None,
+        help="osu!lazer install directory; defaults to OSU_LAZER_PATH or %%LOCALAPPDATA%%\\osulazer\\current",
+    )
+    fc_check.add_argument(
+        "--json",
+        type=Path,
+        default=None,
+        help="optionally write the complete machine-readable judgement report",
+    )
     return parser
 
 
@@ -739,3 +769,39 @@ def finalize_command(args: argparse.Namespace) -> int:
         f"300/100/50/miss {report.count_300}/{report.count_100}/{report.count_50}/{report.count_miss})"
     )
     return 0
+
+
+def fc_check_command(args: argparse.Namespace) -> int:
+    report = score_replay_with_lazer(
+        args.replay,
+        args.beatmap,
+        lazer_path=args.lazer_path,
+    )
+    print("FC: " + ("YES" if report.is_fc else "NO"))
+    print(
+        "300/100/50/miss: "
+        f"{report.count_300}/{report.count_100}/{report.count_50}/{report.count_miss}"
+    )
+    print(f"combo: {report.max_combo}/{report.maximum_combo}")
+    print(f"accuracy: {report.accuracy:.4%}, rank: {report.rank}, passed: {report.passed}")
+    print(f"slider breaks: {len(report.slider_breaks)}")
+    for issue in report.slider_breaks:
+        print(
+            f"  {issue.object_time_ms:.1f}ms {issue.slider_part}: {issue.result} "
+            f"(combo {issue.combo_before}->{issue.combo_after})"
+        )
+    if report.other_combo_breaks:
+        print(f"other combo breaks: {len(report.other_combo_breaks)}")
+    for issue in report.other_combo_breaks:
+        print(
+            f"  {issue.object_time_ms:.1f}ms {issue.hit_object_type}: {issue.result} "
+            f"(combo {issue.combo_before}->{issue.combo_after})"
+        )
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(report.to_json(), ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"wrote {args.json}")
+    return 0 if report.is_fc else 1

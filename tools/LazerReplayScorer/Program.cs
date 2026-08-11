@@ -2,6 +2,8 @@ using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using osu.Framework;
 using NUnit.Framework;
 using osu.Framework.Platform;
@@ -21,7 +23,40 @@ using osu.Game.Scoring;
 using osu.Game.Scoring.Legacy;
 using osu.Game.Screens.Play;
 
-var lazerPath = ResolveLazerPath(args.Length >= 4 ? args[3] : null);
+if (args.Length < 3)
+{
+    Console.Error.WriteLine(
+        "usage: LazerReplayScorer <beatmap.osu> <input.osr> <output.osr> [lazer-path] [--json <report.json>]");
+    return 2;
+}
+
+string? explicitLazerPath = null;
+string? jsonPath = null;
+
+for (var i = 3; i < args.Length; i++)
+{
+    if (args[i] == "--json")
+    {
+        if (++i >= args.Length)
+        {
+            Console.Error.WriteLine("--json requires an output path");
+            return 2;
+        }
+
+        jsonPath = Path.GetFullPath(args[i]);
+        continue;
+    }
+
+    if (explicitLazerPath != null)
+    {
+        Console.Error.WriteLine($"unexpected argument: {args[i]}");
+        return 2;
+    }
+
+    explicitLazerPath = args[i];
+}
+
+var lazerPath = ResolveLazerPath(explicitLazerPath);
 
 if (OperatingSystem.IsWindows())
     SetDllDirectory(lazerPath);
@@ -35,12 +70,6 @@ AssemblyLoadContext.Default.Resolving += (_, name) =>
     var candidate = Path.Combine(lazerPath, $"{name.Name}.dll");
     return File.Exists(candidate) ? AssemblyLoadContext.Default.LoadFromAssemblyPath(candidate) : null;
 };
-
-if (args.Length < 3)
-{
-    Console.Error.WriteLine("usage: LazerReplayScorer <beatmap.osu> <input.osr> <output.osr> [lazer-path]");
-    return 2;
-}
 
 var beatmapPath = Path.GetFullPath(args[0]);
 var replayPath = Path.GetFullPath(args[1]);
@@ -100,6 +129,20 @@ if (hostException != null)
 
 Console.WriteLine($"wrote {outputPath}");
 Console.WriteLine(scene.ResultSummary);
+if (jsonPath != null)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(jsonPath)!);
+    File.WriteAllText(
+        jsonPath,
+        JsonSerializer.Serialize(
+            scene.Report,
+            new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+                WriteIndented = true,
+            }));
+    Console.WriteLine($"wrote {jsonPath}");
+}
 return 0;
 
 sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTestScene
@@ -114,6 +157,7 @@ sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTes
     private WorkingBeatmap? workingBeatmap;
 
     public string ResultSummary { get; private set; } = "";
+    public ReplayScoreReport? Report { get; private set; }
 
     protected override Ruleset CreateRuleset() => new OsuRuleset();
 
@@ -123,6 +167,7 @@ sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTes
         this.replayPath = replayPath;
         this.outputPath = outputPath;
 
+        AddStep("mute audio", muteAudio);
         AddStep("load beatmap", loadBeatmap);
         AddStep("decode replay", decodeReplay);
         AddStep("push replay player", pushPlayer);
@@ -131,6 +176,13 @@ sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTes
         AddLongUntilStep("wait for completion", () => currentPlayer?.GameplayState.HasCompleted == true, TimeSpan.FromMinutes(15));
         AddStep("copy score metadata", copyScoreMetadata);
         AddStep("encode final replay", encodeFinalReplay);
+    }
+
+    private void muteAudio()
+    {
+        Audio.Volume.Value = 0;
+        Audio.VolumeTrack.Value = 0;
+        Audio.VolumeSample.Value = 0;
     }
 
     private void AddLongUntilStep(string name, Func<bool> assertion, TimeSpan timeout)
@@ -258,10 +310,63 @@ sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTes
         counts.TryGetValue(HitResult.Ok, out var ok);
         counts.TryGetValue(HitResult.Meh, out var meh);
         counts.TryGetValue(HitResult.Miss, out var miss);
+        var sliderBreaks = results
+                           .Where(result => result.Type.BreaksCombo() && sliderPart(result) != null)
+                           .Select(toJudgementIssue)
+                           .ToArray();
+        var otherComboBreaks = results
+                               .Where(result => result.Type.BreaksCombo()
+                                                && sliderPart(result) == null
+                                                && result.Type != HitResult.Miss)
+                               .Select(toJudgementIssue)
+                               .ToArray();
+        var maximumCombo = processor.MaximumCombo;
+        var isFc = miss == 0
+                   && sliderBreaks.Length == 0
+                   && otherComboBreaks.Length == 0
+                   && scoreInfo.MaxCombo == maximumCombo;
+
+        Report = new ReplayScoreReport(
+            isFc,
+            scoreInfo.TotalScore,
+            scoreInfo.MaxCombo,
+            maximumCombo,
+            scoreInfo.Rank.ToString(),
+            scoreInfo.Accuracy,
+            scoreInfo.Passed,
+            Convert.ToInt64(great),
+            Convert.ToInt64(ok),
+            Convert.ToInt64(meh),
+            Convert.ToInt64(miss),
+            counts.ToDictionary(
+                pair => JsonNamingPolicy.SnakeCaseLower.ConvertName(pair.Key.ToString()),
+                pair => Convert.ToInt64(pair.Value)),
+            sliderBreaks,
+            otherComboBreaks);
         ResultSummary =
             $"score={scoreInfo.TotalScore} combo={scoreInfo.MaxCombo} rank={scoreInfo.Rank} " +
-            $"accuracy={scoreInfo.Accuracy:P4} great/ok/meh/miss={great}/{ok}/{meh}/{miss} passed={scoreInfo.Passed}";
+            $"accuracy={scoreInfo.Accuracy:P4} great/ok/meh/miss={great}/{ok}/{meh}/{miss} " +
+            $"slider_breaks={sliderBreaks.Length} fc={isFc} passed={scoreInfo.Passed}";
     }
+
+    private static string? sliderPart(JudgementResult result) => result.HitObject.GetType().Name switch
+    {
+        "SliderHeadCircle" => "head",
+        "SliderTick" => "tick",
+        "SliderRepeat" => "repeat",
+        "SliderTailCircle" => "tail",
+        _ => null,
+    };
+
+    private static JudgementIssue toJudgementIssue(JudgementResult result) => new(
+        sliderPart(result),
+        result.HitObject.GetType().Name,
+        result.Type.ToString(),
+        result.HitObject.StartTime,
+        result.TimeAbsolute,
+        result.TimeOffset,
+        result.ComboAtJudgement,
+        result.ComboAfterJudgement);
 
     private void encodeFinalReplay()
     {
@@ -289,6 +394,36 @@ sealed class ScoreReplayTestScene : osu.Game.Tests.Visual.RateAdjustedBeatmapTes
         protected override WorkingBeatmap GetBeatmap(string md5Hash) => beatmap;
     }
 }
+
+sealed record ReplayScoreReport(
+    bool IsFc,
+    long Score,
+    int MaxCombo,
+    int MaximumCombo,
+    string Rank,
+    double Accuracy,
+    bool Passed,
+    [property: JsonPropertyName("count_300")]
+    long Count300,
+    [property: JsonPropertyName("count_100")]
+    long Count100,
+    [property: JsonPropertyName("count_50")]
+    long Count50,
+    [property: JsonPropertyName("count_miss")]
+    long CountMiss,
+    IReadOnlyDictionary<string, long> Statistics,
+    IReadOnlyList<JudgementIssue> SliderBreaks,
+    IReadOnlyList<JudgementIssue> OtherComboBreaks);
+
+sealed record JudgementIssue(
+    string? SliderPart,
+    string HitObjectType,
+    string Result,
+    double ObjectTimeMs,
+    double JudgementTimeMs,
+    double TimeOffsetMs,
+    int ComboBefore,
+    int ComboAfter);
 
 partial class Program
 {
