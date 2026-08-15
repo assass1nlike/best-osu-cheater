@@ -2,7 +2,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from lazer_clock_sync import ClockSyncError, LazerClockReader, ReplayTimeline, initial_key_mask
+from lazer_clock_sync import (
+    ClockSample,
+    ClockSyncError,
+    LazerClockReader,
+    LiveClockCorrector,
+    ReplayTimeline,
+    WslLazerClockReader,
+    initial_key_mask,
+)
 
 
 def frame(delta: int, keys: int = 0) -> SimpleNamespace:
@@ -31,6 +39,51 @@ def test_initial_key_mask_preserves_key_held_at_clock_cut() -> None:
     assert initial_key_mask(frames, 2) == 1
     assert initial_key_mask(frames, 3) == 1
     assert initial_key_mask(frames, 4) == 0
+
+
+def test_live_clock_corrector_advances_input_when_game_clock_runs_fast() -> None:
+    anchor = ClockSample(time_ms=0.0, qpc_seconds=100.0, source_address="gameplay")
+    corrector = LiveClockCorrector(anchor, 1.5, window_size=3, minimum_samples=3)
+
+    corrector.observe(
+        ClockSample(time_ms=map_ms, qpc_seconds=100.0 + real_s, source_address="gameplay")
+        for real_s, map_ms in [(1.0, 1500.0), (2.0, 3001.5), (3.0, 4503.0)]
+    )
+    initial_target = corrector.target_qpc_seconds(6000.0)
+
+    corrector.observe(
+        ClockSample(time_ms=map_ms, qpc_seconds=100.0 + real_s, source_address="gameplay")
+        for real_s, map_ms in [(4.0, 6006.0), (5.0, 7507.5), (6.0, 9009.0)]
+    )
+
+    assert corrector.correction_ms < 0
+    assert corrector.target_qpc_seconds(6000.0) < initial_target
+
+
+def test_live_clock_corrector_rejects_samples_from_another_clock_source() -> None:
+    anchor = ClockSample(time_ms=0.0, qpc_seconds=100.0, source_address="gameplay")
+    corrector = LiveClockCorrector(anchor, 1.0, window_size=1, minimum_samples=1)
+
+    corrector.observe(
+        [ClockSample(time_ms=5000.0, qpc_seconds=101.0, source_address="preview")]
+    )
+
+    assert corrector.correction_ms == 0.0
+
+
+def test_clock_reader_drains_available_samples_without_blocking() -> None:
+    reader = LazerClockReader(1, reader_path="missing.exe")
+    reader._events.put({"event": "sample", "time_ms": 100.0, "qpc_seconds": 1.0})
+    reader._events.put({"event": "attached"})
+    reader._events.put({"event": "sample", "time_ms": 120.0, "qpc_seconds": 1.02})
+
+    samples = reader.drain_samples()
+
+    assert [(sample.time_ms, sample.qpc_seconds) for sample in samples] == [
+        (100.0, 1.0),
+        (120.0, 1.02),
+    ]
+    assert reader.drain_samples() == ()
 
 
 def test_wait_for_running_clock_uses_forward_moving_samples() -> None:
@@ -184,3 +237,21 @@ def test_wait_for_gameplay_start_accepts_high_time_after_transition_boundary() -
     sample = reader.wait_for_gameplay_start(0.5, max_time_ms=1000.0, boundary_samples=2)
 
     assert sample.time_ms == 9020.0
+
+
+def test_wsl_clock_calibration_uses_lowest_round_trip(monkeypatch) -> None:
+    reader = WslLazerClockReader("Ubuntu-24.04", reader_path="missing.py")
+    windows_times = iter([100.000, 100.020, 200.000, 200.004])
+    events = iter(
+        [
+            {"event": "sync", "id": 0, "qpc_seconds": 10.005},
+            {"event": "sync", "id": 1, "qpc_seconds": 20.001},
+        ]
+    )
+    monkeypatch.setattr("lazer_clock_sync.time.perf_counter", lambda: next(windows_times))
+    monkeypatch.setattr(reader, "_send_control", lambda _value: None)
+    monkeypatch.setattr(reader, "_next_event", lambda _timeout: next(events))
+
+    reader._calibrate_clock(sample_count=2)
+
+    assert reader._qpc_offset_seconds == pytest.approx(180.001)

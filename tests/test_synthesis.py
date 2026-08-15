@@ -3,7 +3,7 @@ import random
 
 import pytest
 
-from synthesis_osu_play.beatmap import Beatmap, HitObject
+from synthesis_osu_play.beatmap import Beatmap, BreakPeriod, HitObject
 from synthesis_osu_play.finalize import finalize_replay_metadata
 from synthesis_osu_play.mods import (
     MOD_DOUBLE_TIME,
@@ -33,6 +33,7 @@ from synthesis_osu_play.synthesis import (
     modded_hit_objects_for_matching,
     randomized_primary_key_repeat_threshold_ms,
     resolve_synthesized_overlaps,
+    synthesize_spinner_interval,
     synthesize_replays,
     to_absolute_frames,
 )
@@ -49,6 +50,24 @@ def phase_for_seed(seed: int) -> float:
 class LowerBoundRandom:
     def uniform(self, lower: float, _upper: float) -> float:
         return lower
+
+
+def test_spinner_press_does_not_start_inside_break_period(monkeypatch) -> None:
+    spinner = HitObject(1, 256.0, 192.0, 161974, 8, end_time_ms=163864)
+    previous = ClickInterval(0, LEGACY_Z_KEY, 146800, 146914)
+    monkeypatch.setattr(synthesis_module, "spinner_boundary_time", lambda *_args: 159066)
+
+    interval = synthesize_spinner_interval(
+        spinner,
+        previous,
+        None,
+        previous,
+        None,
+        random.Random(1),
+        break_periods=(BreakPeriod(147054, 161374),),
+    )
+
+    assert interval.start_ms == 161874
 
 
 def make_replay(

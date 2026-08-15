@@ -9,7 +9,7 @@ from math import dist, floor, isfinite, nextafter
 from random import Random
 from typing import TYPE_CHECKING
 
-from .beatmap import Beatmap, HitObject
+from .beatmap import Beatmap, BreakPeriod, HitObject
 from .mods import (
     MOD_EASY,
     MOD_HARD_ROCK,
@@ -43,6 +43,7 @@ LEGACY_LEFT_ACTION_MASK = LEGACY_LEFT_BUTTON | LEGACY_KEY_1
 LEGACY_RIGHT_ACTION_MASK = LEGACY_RIGHT_BUTTON | LEGACY_KEY_2
 PRIMARY_KEY_REPEAT_THRESHOLD_MS = 350
 PRIMARY_KEY_REPEAT_THRESHOLD_JITTER_MS = 50
+SPINNER_PREPRESS_LEAD_MS = 100
 DYNAMIC_PHASE_NOISE_STD_RAD = 0.15
 LEGACY_INPUT_ACTION_MASKS = (
     (LEGACY_Z_KEY, LEGACY_LEFT_ACTION_MASK),
@@ -672,6 +673,7 @@ def synthesize_key_intervals_for_beatmap(
                 second_previous_clicks[object_index],
                 second_next_clicks[object_index],
                 spinner_rng,
+                break_periods=beatmap.break_periods,
             )
             averaged_intervals.append(interval)
             required_end_times.append(interval.end_ms)
@@ -1185,6 +1187,8 @@ def synthesize_spinner_interval(
     second_previous_click: ClickInterval | None,
     second_next_click: ClickInterval | None,
     rng: Random,
+    *,
+    break_periods: tuple[BreakPeriod, ...] = (),
 ) -> KeyInterval:
     start_anchor = spinner_boundary_anchor(
         first_previous_click.end_ms if first_previous_click is not None else None,
@@ -1200,6 +1204,10 @@ def synthesize_spinner_interval(
     )
 
     start_ms = spinner_boundary_time(start_anchor, obj.time_ms, rng)
+    for break_period in break_periods:
+        if break_period.start_ms <= start_ms < break_period.end_ms:
+            start_ms = max(break_period.end_ms, obj.time_ms - SPINNER_PREPRESS_LEAD_MS)
+            break
     end_ms = spinner_boundary_time(end_anchor, obj.resolved_end_time_ms, rng)
     if end_ms <= start_ms:
         end_ms = start_ms + 1

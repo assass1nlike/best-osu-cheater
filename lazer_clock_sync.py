@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import bisect
+from collections import deque
 import json
 import os
 import queue
+import statistics
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from wsl_lazer import to_wsl_path
 
 
 class ClockSyncError(RuntimeError):
@@ -30,6 +34,69 @@ class ClockSample:
     time_ms: float
     qpc_seconds: float
     source_address: str | None = None
+
+
+class LiveClockCorrector:
+    """Track long-term drift without following frame-to-frame clock jitter."""
+
+    def __init__(
+        self,
+        anchor: ClockJump | ClockSample,
+        speed: float,
+        *,
+        window_size: int = 201,
+        minimum_samples: int = 21,
+    ) -> None:
+        if speed <= 0:
+            raise ValueError("speed must be positive")
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if minimum_samples <= 0 or minimum_samples > window_size:
+            raise ValueError("minimum_samples must be between 1 and window_size")
+
+        self.speed = speed
+        self.base_phase_s = anchor.qpc_seconds - anchor.time_ms / (1000.0 * speed)
+        self._phases: deque[float] = deque(maxlen=window_size)
+        self._minimum_samples = minimum_samples
+        self._reference_phase_s: float | None = None
+        self._correction_s = 0.0
+        self._last_qpc_seconds = anchor.qpc_seconds
+        self._source_address: str | None = getattr(anchor, "source_address", None)
+
+    @property
+    def correction_ms(self) -> float:
+        return self._correction_s * 1000.0
+
+    def observe(self, samples: Iterable[ClockSample]) -> None:
+        for sample in samples:
+            if sample.qpc_seconds <= self._last_qpc_seconds:
+                continue
+            if (
+                self._source_address is not None
+                and sample.source_address is not None
+                and sample.source_address != self._source_address
+            ):
+                continue
+            if self._source_address is None and sample.source_address is not None:
+                self._source_address = sample.source_address
+
+            self._last_qpc_seconds = sample.qpc_seconds
+            phase_s = sample.qpc_seconds - sample.time_ms / (1000.0 * self.speed)
+            self._phases.append(phase_s)
+
+        if len(self._phases) < self._minimum_samples:
+            return
+        median_phase_s = statistics.median(self._phases)
+        if self._reference_phase_s is None:
+            self._reference_phase_s = median_phase_s
+        self._correction_s = median_phase_s - self._reference_phase_s
+
+    def target_qpc_seconds(self, replay_time_ms: float) -> float:
+        return (
+            self.base_phase_s
+            + replay_time_ms / (1000.0 * self.speed)
+            + self._correction_s
+        )
 
 
 @dataclass(frozen=True)
@@ -72,6 +139,14 @@ def default_reader_path() -> Path:
     )
 
 
+def default_wsl_reader_path() -> Path:
+    return Path(__file__).resolve().parent / "tools" / "wsl" / "lazer_clock_reader.py"
+
+
+def default_offsets_path() -> Path:
+    return Path(__file__).resolve().parent / "tools" / "LazerClockReader" / "offsets.json"
+
+
 def window_process_id(hwnd: int) -> int:
     """Return the owning process id for a Win32 window handle."""
 
@@ -110,6 +185,7 @@ class LazerClockReader:
         self._events: queue.Queue[dict[str, object]] = queue.Queue()
         self._reader_thread: threading.Thread | None = None
         self._last_sample: ClockSample | None = None
+        self._qpc_offset_seconds = 0.0
 
     @property
     def started(self) -> bool:
@@ -374,6 +450,20 @@ class LazerClockReader:
             except queue.Empty:
                 return
 
+    def drain_samples(self) -> tuple[ClockSample, ...]:
+        samples: list[ClockSample] = []
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                return tuple(samples)
+            self._remember_event(event)
+            if event.get("event") == "error":
+                raise ClockSyncError(str(event.get("message", "clock reader error")))
+            sample = _event_to_sample(event)
+            if sample is not None:
+                samples.append(sample)
+
     def stop(self) -> None:
         process = self._process
         self._process = None
@@ -416,6 +506,13 @@ class LazerClockReader:
             except json.JSONDecodeError:
                 continue
             if isinstance(event, dict):
+                if "qpc_seconds" in event:
+                    try:
+                        event["qpc_seconds"] = (
+                            float(event["qpc_seconds"]) + self._qpc_offset_seconds
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 self._events.put(event)
         if process.poll() not in (None, 0):
             self._events.put(
@@ -439,6 +536,110 @@ class LazerClockReader:
             self._last_sample = sample
 
 
+class WslLazerClockReader(LazerClockReader):
+    """Run the clock reader inside WSL and translate its monotonic clock."""
+
+    def __init__(self, distro: str, **kwargs: object) -> None:
+        super().__init__(0, **kwargs)
+        self.distro = distro
+
+    def start(self) -> bool:
+        if self.started:
+            return True
+        script_path = self.reader_path
+        offsets_path = default_offsets_path()
+        if not script_path.exists():
+            raise ClockSyncError(f"WSL clock reader not found: {script_path}")
+        if not offsets_path.exists():
+            raise ClockSyncError(f"clock offsets not found: {offsets_path}")
+
+        command = [
+            "wsl.exe",
+            "-d",
+            self.distro,
+            "-u",
+            "root",
+            "--",
+            "python3",
+            to_wsl_path(script_path),
+            "--offsets-path",
+            to_wsl_path(offsets_path),
+            "--interval-ms",
+            str(self.interval_ms),
+            "--jump-threshold-ms",
+            str(self.jump_threshold_ms),
+            "--serve",
+        ]
+        if self.wait_for_jump_mode:
+            command.append("--wait-for-jump")
+        if self.stream_samples:
+            command.extend(
+                ["--emit-samples", "--sample-interval-ms", str(self.sample_interval_ms)]
+            )
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            raise ClockSyncError(f"could not start WSL clock reader: {exc}") from exc
+
+        self._reader_thread = threading.Thread(
+            target=self._collect_events,
+            name="osu-lazer-wsl-clock-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        try:
+            service = self._next_event(self.ready_timeout_s)
+            if service.get("event") != "service":
+                raise ClockSyncError(f"unexpected WSL clock service event: {service}")
+            self._calibrate_clock()
+            self._send_control({"command": "start"})
+            event = self._next_event(self.ready_timeout_s)
+            if event.get("event") not in {"attached", "ready"}:
+                raise ClockSyncError(f"unexpected WSL clock reader event: {event}")
+        except ClockSyncError:
+            self.stop()
+            raise
+        return True
+
+    def _calibrate_clock(self, sample_count: int = 7) -> None:
+        samples: list[tuple[float, float]] = []
+        for identifier in range(sample_count):
+            started = time.perf_counter()
+            self._send_control({"command": "sync", "id": identifier})
+            event = self._next_event(self.ready_timeout_s)
+            finished = time.perf_counter()
+            if event.get("event") != "sync" or event.get("id") != identifier:
+                raise ClockSyncError(f"unexpected WSL clock sync event: {event}")
+            try:
+                linux_qpc = float(event["qpc_seconds"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ClockSyncError(f"invalid WSL clock sync event: {event}") from exc
+            round_trip = finished - started
+            offset = (started + finished) / 2.0 - linux_qpc
+            samples.append((round_trip, offset))
+        self._qpc_offset_seconds = min(samples, key=lambda sample: sample[0])[1]
+
+    def _send_control(self, value: dict[str, object]) -> None:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise ClockSyncError("WSL clock reader control stream is unavailable")
+        try:
+            process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        except OSError as exc:
+            raise ClockSyncError(f"could not control WSL clock reader: {exc}") from exc
+
+
 def start_clock_reader(
     process_id: int,
     *,
@@ -449,17 +650,21 @@ def start_clock_reader(
     wait_for_jump: bool = True,
     stream_samples: bool = False,
     sample_interval_ms: int = 20,
+    wsl_distro: str | None = None,
 ) -> LazerClockReader:
-    reader = LazerClockReader(
-        process_id,
-        reader_path=reader_path,
-        ready_timeout_s=ready_timeout_ms / 1000.0,
+    common = dict(
+        reader_path=reader_path or (default_wsl_reader_path() if wsl_distro else None),
+        ready_timeout_s=max(ready_timeout_ms / 1000.0, 12.0) if wsl_distro else ready_timeout_ms / 1000.0,
         jump_threshold_ms=jump_threshold_ms,
         interval_ms=interval_ms,
         wait_for_jump=wait_for_jump,
         stream_samples=stream_samples,
         sample_interval_ms=sample_interval_ms,
     )
+    if wsl_distro:
+        reader = WslLazerClockReader(wsl_distro, **common)
+    else:
+        reader = LazerClockReader(process_id, **common)
     reader.start()
     return reader
 

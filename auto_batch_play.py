@@ -24,6 +24,7 @@ from synthesis_osu_play.replay_quality import (
     SPARSE_MOVEMENT_MIN_GAP_MS,
     sparse_movement_gaps,
 )
+from wsl_lazer import WslgViewport, distro_from_window_title, query_viewport
 
 # ---------------------------------------------------------------------------
 # Windows input (same as replay_bot)
@@ -62,7 +63,16 @@ def send_key(vk, down):
 def tap(vk, dur=0.06):
     send_key(vk, True); time.sleep(dur); send_key(vk, False); time.sleep(0.03)
 
-def random_safe_cursor_position(rng):
+def random_safe_cursor_position(rng, viewport=None):
+    if viewport is not None:
+        screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+        x = viewport.left + rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * viewport.width
+        y = viewport.top + rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * viewport.height
+        return (
+            round(x * ABSOLUTE_COORDINATE_MAX / max(screen_width - 1, 1)),
+            round(y * ABSOLUTE_COORDINATE_MAX / max(screen_height - 1, 1)),
+        )
     return (
         round(rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * ABSOLUTE_COORDINATE_MAX),
         round(rng.uniform(SAFE_CURSOR_MIN_RATIO, SAFE_CURSOR_MAX_RATIO) * ABSOLUTE_COORDINATE_MAX),
@@ -90,11 +100,25 @@ def find_osu_hwnd():
         h = ctypes.windll.user32.GetWindow(h, 2)
     return None
 
+def osu_window_title(hwnd):
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+def is_wslg_osu(hwnd):
+    return bool(hwnd and distro_from_window_title(osu_window_title(hwnd)))
+
+def wslg_viewport(hwnd):
+    distro = distro_from_window_title(osu_window_title(hwnd)) if hwnd else None
+    return query_viewport(distro) if distro else None
+
 def type_into_osu(text):
     """Type text into osu!lazer using WM_CHAR messages."""
     hwnd = find_osu_hwnd()
-    if not hwnd:
-        print("    WARNING: osu!lazer window not found, using SendInput fallback")
+    if not hwnd or is_wslg_osu(hwnd):
+        if not hwnd:
+            print("    WARNING: osu!lazer window not found, using SendInput fallback")
         for ch in str(text):
             vk = ord(ch)
             if 0x30 <= vk <= 0x39:
@@ -109,7 +133,7 @@ def type_into_osu(text):
 def press_backspace(count=7):
     hwnd = find_osu_hwnd()
     for _ in range(count):
-        if hwnd:
+        if hwnd and not is_wslg_osu(hwnd):
             ctypes.windll.user32.PostMessageW(hwnd, 0x0100, 0x08, 0)  # WM_KEYDOWN VK_BACK
             time.sleep(0.03)
             ctypes.windll.user32.PostMessageW(hwnd, 0x0101, 0x08, 0)  # WM_KEYUP VK_BACK
@@ -122,7 +146,7 @@ def press_enter():
 
 def press_esc():
     hwnd = find_osu_hwnd()
-    if hwnd:
+    if hwnd and not is_wslg_osu(hwnd):
         ctypes.windll.user32.PostMessageW(hwnd, 0x0100, 0x1B, 0)
         time.sleep(0.05)
         ctypes.windll.user32.PostMessageW(hwnd, 0x0101, 0x1B, 0)
@@ -156,7 +180,7 @@ def main():
     parser.add_argument("--k1", default="Z")
     parser.add_argument("--k2", default="X")
     parser.add_argument("--clock-reader", default=None,
-                        help="Path to LazerClockReader.exe or its .dll")
+                        help="Path to the native Windows clock reader (WSLg selects its reader automatically)")
     parser.add_argument("--clock-sync-timeout-ms", type=int, default=5000)
     parser.add_argument("--clock-jump-threshold-ms", type=float, default=100.0)
     parser.add_argument("--no-clock-sync", action="store_true",
@@ -324,8 +348,17 @@ def main():
 
         # Clear search and type beatmap ID
         print("  Typing beatmap ID...")
+        hwnd = find_osu_hwnd()
+        if hwnd:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
         if played > 0:
-            cursor_x, cursor_y = random_safe_cursor_position(cursor_rng)
+            try:
+                viewport = wslg_viewport(hwnd)
+            except RuntimeError as exc:
+                print(f"  WSLg viewport unavailable ({exc}); using screen center region")
+                viewport = None
+            cursor_x, cursor_y = random_safe_cursor_position(cursor_rng, viewport)
             move_mouse_absolute(cursor_x, cursor_y)
         press_backspace(10)
         time.sleep(0.2)

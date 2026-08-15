@@ -6,6 +6,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from random import Random
 
@@ -21,12 +22,15 @@ LOGGER = logging.getLogger(__name__)
 
 _CENTER_X, _CENTER_Y = 256.0, 192.0
 _MIN_RPM = 225
-_MIN_LIBRARY_RPM = 300
+# OD10 is the highest spinner difficulty after HR. Under DT/NC this is
+# equivalent to effective OD11.11 and requires 225 * 1.5 real RPM for a 300.
+_MIN_LIBRARY_RPM = _MIN_RPM * 1.5
 _MAX_RPM = 500
 _DT_SPEED = 1.5
 _FIRST_BLEND_WEIGHT_MIN = 0.85
 _FIRST_BLEND_WEIGHT_MAX = 0.95
 _SLIDER_TAIL_LENIENCY_MS = 36
+_MAX_TRANSITION_DURATION_MS = 500
 DEFAULT_SPINNER_LIBRARY_PATH = (
     Path(__file__).resolve().parent.parent
     / "artifacts"
@@ -359,6 +363,53 @@ def _random_blend_weights(candidate_count: int, rng: Random) -> list[float]:
     return [first_weight, 1.0 - first_weight]
 
 
+def _worst_case_spins_required(duration_ms: int) -> int:
+    """Return lazer's OD10 spin count required for a Great judgement."""
+    return int(_MIN_RPM * max(0, duration_ms) / 60000.0 + 0.0001)
+
+
+def _select_eligible_blend(
+    candidates: list[dict],
+    output_duration_ms: int,
+    playback_duration_ms: int,
+    weights: list[float],
+) -> tuple[list[dict], list[tuple[float, float]], float]:
+    """Select the best candidate pair whose final blend can receive a 300."""
+    required_revolutions = _worst_case_spins_required(output_duration_ms)
+    candidate_groups = (
+        ([candidate] for candidate in candidates)
+        if len(candidates) == 1
+        else (list(pair) for pair in combinations(candidates, 2))
+    )
+
+    best_revolutions = 0.0
+    for selected in candidate_groups:
+        selected_weights = weights[:len(selected)]
+        blended = blend_trajectories(
+            selected,
+            output_duration_ms,
+            selected_weights,
+            playback_duration_ms=playback_duration_ms,
+        )
+        _net_rpm, net_revolutions = _calc_rpm_for_segment(
+            [
+                {"t_ms": index, "x": point[0], "y": point[1]}
+                for index, point in enumerate(blended)
+            ],
+            0,
+            output_duration_ms,
+        )
+        best_revolutions = max(best_revolutions, net_revolutions)
+        if net_revolutions + 1e-9 >= required_revolutions:
+            return selected, blended, net_revolutions
+
+    raise ValueError(
+        "spinner replacement cannot receive a 300 at OD10: "
+        f"best blend {best_revolutions:.3f}/{required_revolutions} revolutions "
+        f"for {output_duration_ms}ms"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Slider tail / last-object time
 # ---------------------------------------------------------------------------
@@ -489,6 +540,8 @@ def replace_spinner_segments(
             t1 = sp_start_ms  # first object: no transition in
         if t4 is None:
             t4 = sp_end_ms   # last object: no transition out
+        t1 = max(t1, sp_start_ms - _MAX_TRANSITION_DURATION_MS)
+        t4 = min(t4, sp_end_ms + _MAX_TRANSITION_DURATION_MS)
 
         t2 = sp_start_ms
         t3 = sp_end_ms
@@ -506,6 +559,7 @@ def replace_spinner_segments(
             playback_duration_ms,
             start_pos,
             end_pos,
+            top_n=len(library),
             dt_mode=dt_mode,
             strict_rpm=(spinner_mode != "all"),
         )
@@ -522,24 +576,34 @@ def replace_spinner_segments(
             LOGGER.warning("no library match for %sms spinner", duration_ms)
             continue
 
-        # Blend
+        # Blend. Candidate metadata alone cannot guarantee the final result:
+        # phase differences and endpoint sampling can reduce net rotation.
         try:
             weights = _random_blend_weights(len(candidates), blend_rng)
             LOGGER.info("spinner blend weights: %s", [round(weight, 4) for weight in weights])
-            blended = blend_trajectories(
+            selected_candidates, blended, net_revolutions = _select_eligible_blend(
                 candidates,
                 duration_ms,
+                playback_duration_ms,
                 weights,
-                playback_duration_ms=playback_duration_ms,
             )
             eff_rpm, _ = calc_spinner_rpm([
                 {"t_ms": i, "x": pt[0], "y": pt[1]}
                 for i, pt in enumerate(blended)
             ])
             eff_rpm *= _DT_SPEED if dt_mode else 1.0
-        except Exception as e:
-            LOGGER.warning("spinner blend failed: %s", e)
-            continue
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"spinner blend failed: {exc}") from exc
+
+        LOGGER.info(
+            "spinner selected %s/%s searched candidates; net revolutions=%.3f/%s",
+            len(selected_candidates),
+            len(candidates),
+            net_revolutions,
+            _worst_case_spins_required(duration_ms),
+        )
 
         replacements.append(SpinnerReplacement(
             spinner_index=spin_idx,
@@ -552,12 +616,12 @@ def replace_spinner_segments(
             blended_trajectory=blended,
             rpm_original=rpm,
             rpm_replacement=eff_rpm,
-            candidates_used=len(candidates),
-            blend_weights=weights,
+            candidates_used=len(selected_candidates),
+            blend_weights=weights[:len(selected_candidates)],
             library_ids=[{"player": c["player"], "beatmap": c.get("beatmap_title",""),
                           "duration_ms": c["spinner_duration_ms"], "target_duration_ms": playback_duration_ms,
                           "rpm": c.get("avg_rpm",0)}
-                         for c in candidates],
+                         for c in selected_candidates],
         ))
 
     if not replacements:

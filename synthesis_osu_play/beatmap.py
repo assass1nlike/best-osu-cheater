@@ -22,6 +22,12 @@ class TimingPoint:
 
 
 @dataclass(frozen=True)
+class BreakPeriod:
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True)
 class HitObject:
     index: int
     x: float
@@ -73,6 +79,7 @@ class Beatmap:
     slider_multiplier: float = 1.4
     slider_tick_rate: float = 1.0
     timing_points: tuple[TimingPoint, ...] = ()
+    break_periods: tuple[BreakPeriod, ...] = ()
 
     @classmethod
     def read_path(cls, path: str | Path) -> "Beatmap":
@@ -90,6 +97,7 @@ class Beatmap:
         slider_multiplier = 1.4
         slider_tick_rate = 1.0
         timing_points: list[TimingPoint] = []
+        break_periods: list[BreakPeriod] = []
         hit_objects: list[HitObject] = []
 
         for raw_line in text.splitlines():
@@ -117,6 +125,10 @@ class Beatmap:
                     slider_tick_rate = float(value)
             elif current_section == "TimingPoints":
                 timing_points.append(parse_timing_point(line))
+            elif current_section == "Events":
+                break_period = parse_break_period(line)
+                if break_period is not None:
+                    break_periods.append(break_period)
             elif current_section == "HitObjects":
                 hit_objects.append(
                     parse_hit_object(
@@ -141,6 +153,7 @@ class Beatmap:
             slider_multiplier=slider_multiplier,
             slider_tick_rate=slider_tick_rate,
             timing_points=tuple(timing_points),
+            break_periods=tuple(break_periods),
         )
 
     @property
@@ -188,6 +201,22 @@ def parse_timing_point(line: str) -> TimingPoint:
         )
     except ValueError as exc:
         raise BeatmapFormatError(f"invalid timing point values: {line!r}") from exc
+
+
+def parse_break_period(line: str) -> BreakPeriod | None:
+    parts = line.split(",")
+    if not parts or parts[0].strip() != "2":
+        return None
+    if len(parts) < 3:
+        raise BeatmapFormatError(f"invalid break period: {line!r}")
+    try:
+        start_ms = int(float(parts[1]))
+        end_ms = int(float(parts[2]))
+    except ValueError as exc:
+        raise BeatmapFormatError(f"invalid break period: {line!r}") from exc
+    if end_ms <= start_ms:
+        raise BeatmapFormatError(f"invalid break period: {line!r}")
+    return BreakPeriod(start_ms=start_ms, end_ms=end_ms)
 
 
 def parse_hit_object(
