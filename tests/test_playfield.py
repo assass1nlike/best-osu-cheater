@@ -33,3 +33,24 @@ def test_fullscreen_playfield_flips_hard_rock_y_coordinate() -> None:
 
     assert playfield.to_absolute(128, 80, hard_rock=True) == playfield.to_absolute(128, 304)
     assert playfield.to_absolute(256, 192, hard_rock=True) == playfield.to_absolute(256, 192)
+
+
+def test_windowed_playfield_maps_into_offset_viewport() -> None:
+    playfield = FullscreenPlayfield.from_viewport(
+        3840,
+        2160,
+        left=1243,
+        top=723,
+        width=1366,
+        height=768,
+    )
+
+    assert playfield.scale == pytest.approx(1.6)
+    assert playfield.width == pytest.approx(819.2)
+    assert playfield.height == pytest.approx(614.4)
+    assert playfield.left == pytest.approx(1516.4)
+    assert playfield.top == pytest.approx(812.6)
+    assert playfield.to_absolute(256, 192) == (
+        round(1926 * 65535 / 3839),
+        round(1119.8 * 65535 / 2159),
+    )

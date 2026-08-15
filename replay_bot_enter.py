@@ -11,12 +11,19 @@ from ctypes import wintypes, byref, sizeof, Structure, Union
 from osrparse import Replay
 from lazer_clock_sync import (
     ClockSyncError,
+    LiveClockCorrector,
     ReplayTimeline,
     initial_key_mask,
     start_clock_reader,
     window_process_id,
 )
 from synthesis_osu_play.playfield import FullscreenPlayfield
+from wsl_lazer import (
+    DEFAULT_WSLG_CURSOR_HZ,
+    WslgInputRateLimiter,
+    distro_from_window_title,
+    query_viewport,
+)
 from synthesis_osu_play.replay_quality import (
     SPARSE_MOVEMENT_ERROR_COUNT,
     SPARSE_MOVEMENT_MAX_GAP_MS,
@@ -116,9 +123,9 @@ class IU(Union):
 class IN(Structure):
     _fields_=[("tp",wintypes.DWORD),("u",IU)]
 
-def _mouse_move_input(x,y):
+def _mouse_move_input(x,y, *, no_coalesce=True):
     i=IN(tp=IM); i.u.mi.dx=int(x); i.u.mi.dy=int(y)
-    i.u.mi.fl=MF_M|MF_NC|MF_A
+    i.u.mi.fl=MF_M|MF_A|(MF_NC if no_coalesce else 0)
     return i
 
 def _keyboard_input(vk,down):
@@ -146,9 +153,9 @@ def kkey(vk,down):
     """Send keyboard via SendInput with scan code."""
     _send_inputs([_keyboard_input(vk,down)])
 
-def send_frame_input(x,y,key_events):
+def send_frame_input(x,y,key_events, *, no_coalesce=True):
     """Submit a frame's cursor and key changes as one ordered Windows input batch."""
-    inputs=[_mouse_move_input(x,y)]
+    inputs=[_mouse_move_input(x,y,no_coalesce=no_coalesce)]
     inputs.extend(_keyboard_input(vk,down) for vk,down in key_events)
     _send_inputs(inputs)
 
@@ -252,7 +259,7 @@ def main():
     parser.add_argument('--no-clock-sync', dest='clock_sync', action='store_false',
                         help='Use the legacy local timer after SPACE')
     parser.add_argument('--clock-reader', default=None,
-                        help='Path to LazerClockReader.exe or its .dll')
+                        help='Path to the native Windows clock reader (WSLg selects its reader automatically)')
     parser.add_argument('--clock-sync-timeout-ms', type=int, default=5000,
                         help='Timeout for reader startup and SPACE acceptance (default: 5000)')
     parser.add_argument('--clock-jump-threshold-ms', type=float, default=100.0,
@@ -311,7 +318,14 @@ def main():
     global osu_hwnd; osu_hwnd = hwnd
     if not hwnd: print("ERROR: osu!lazer not running!"); return
     osu_pid = window_process_id(hwnd)
+    wsl_distro = distro_from_window_title(title)
     print(f"\n  osu!lazer: \"{title}\"")
+    if wsl_distro:
+        print(f"  WSLg: {wsl_distro}")
+        print(
+            f"  WSLg input: cursor capped at {DEFAULT_WSLG_CURSOR_HZ:g} Hz; "
+            "key edges preserved"
+        )
     s=ctypes.windll.user32.GetWindowLongW(hwnd,-16)
     if s&0x20000000:
         ctypes.windll.user32.ShowWindow(hwnd,9); ctypes.windll.user32.ShowWindow(hwnd,5)
@@ -371,12 +385,32 @@ def main():
     print(f"  {tms/1000:.1f}s replay ({skipped/1000:.1f}s pause skipped) | {len(frames)} frames")
 
     sw,sh=scr()
-    playfield = FullscreenPlayfield.from_screen(sw, sh)
     window_width = rect.right - rect.left
     window_height = rect.bottom - rect.top
-    if (rect.left, rect.top, window_width, window_height) != (0, 0, sw, sh):
+    if wsl_distro:
+        try:
+            viewport = query_viewport(wsl_distro)
+        except RuntimeError as exc:
+            print(f"  ERROR: {exc}")
+            return
+        playfield = FullscreenPlayfield.from_viewport(
+            sw,
+            sh,
+            left=viewport.left,
+            top=viewport.top,
+            width=viewport.width,
+            height=viewport.height,
+        )
+        viewport_label = (
+            f"{viewport.width}x{viewport.height} at "
+            f"({viewport.left}, {viewport.top})"
+        )
+    else:
+        playfield = FullscreenPlayfield.from_screen(sw, sh)
+        viewport_label = f"{sw}x{sh} at (0, 0)"
+    if not wsl_distro and (rect.left, rect.top, window_width, window_height) != (0, 0, sw, sh):
         print("  WARNING: osu!lazer is not covering the primary screen; fullscreen is required")
-    print(f"  Screen: {sw}x{sh} | Playfield: {playfield.width:.1f}x{playfield.height:.1f} "
+    print(f"  Viewport: {viewport_label} | Playfield: {playfield.width:.1f}x{playfield.height:.1f} "
           f"at ({playfield.left:.1f}, {playfield.top:.1f}) | Scale: {playfield.scale:.4f}")
 
     def map_osu(osu_x, osu_y):
@@ -465,9 +499,10 @@ def main():
                     jump_threshold_ms=args.clock_jump_threshold_ms,
                     # Automatic mode must keep sampling through the song-select
                     # preview; its first jump is not gameplay start.
-                    wait_for_jump=args.send_space is True,
-                    stream_samples=args.send_space is not True,
+                    wait_for_jump=args.send_space is True and not wsl_distro,
+                    stream_samples=args.send_space is not True or bool(wsl_distro),
                     sample_interval_ms=5,
+                    wsl_distro=wsl_distro,
                 )
                 print("  Clock reader: ready")
             except ClockSyncError as exc:
@@ -607,18 +642,39 @@ def main():
         first_key_pressed = any(ks.values())
         stage1_passed = False
         stage2_checked = False
+        input_limiter = WslgInputRateLimiter() if wsl_distro else None
+        sent_input_frames = 0
+        dropped_movement_frames = 0
+        clock_corrector = None
+        clock_correction_failed = False
+        if wsl_distro and clock_reader is not None and sync_jump is not None:
+            clock_corrector = LiveClockCorrector(sync_jump, speed)
+            print("  WSLg clock drift correction: enabled")
 
         try:
             for frame_index, frame in enumerate(frames):
                 if kdown(VK_F7): print("\n  F7 ABORT (exit=1)"); sys.exit(1)
                 cursor_x, cursor_y = cursor_positions[frame_index]
+                frame_target_s = time.perf_counter()
 
                 if sync_jump is not None:
                     if frame_index < sync_start_index:
                         continue
                     et = timeline.frame_times_ms[frame_index]
-                    target = (sync_jump.qpc_seconds +
-                              (et - sync_jump.time_ms) / 1000.0 / speed - advance_s)
+                    if clock_corrector is not None:
+                        try:
+                            clock_corrector.observe(clock_reader.drain_samples())
+                        except ClockSyncError as exc:
+                            if not clock_correction_failed:
+                                print(f"  WARNING: live clock correction stopped ({exc})")
+                                clock_correction_failed = True
+                            clock_corrector = None
+                    if clock_corrector is not None:
+                        target = clock_corrector.target_qpc_seconds(et) - advance_s
+                    else:
+                        target = (sync_jump.qpc_seconds +
+                                  (et - sync_jump.time_ms) / 1000.0 / speed - advance_s)
+                    frame_target_s = target
                     w = target - time.perf_counter()
                     if w > 0.001:
                         if w > 0.003:
@@ -641,6 +697,7 @@ def main():
                     if dt > 0:
                         et += dt
                         target = t0 + (et - skipped_ms)/1000.0 - advance_s
+                        frame_target_s = target
                         w = target - time.perf_counter()
                         if w > 0.001:
                             if w > 0.003:
@@ -660,7 +717,22 @@ def main():
                         if d and not first_key_pressed:
                             first_key_pressed = True
                         ks[name] = d
-                send_frame_input(ax, ay, key_events)
+                should_send = input_limiter is None or input_limiter.should_send(
+                    frame_target_s,
+                    time.perf_counter(),
+                    has_key_events=bool(key_events),
+                    force=frame_index == tot - 1,
+                )
+                if should_send:
+                    send_frame_input(
+                        ax,
+                        ay,
+                        key_events,
+                        no_coalesce=input_limiter is None or bool(key_events),
+                    )
+                    sent_input_frames += 1
+                else:
+                    dropped_movement_frames += 1
                 cnt += 1
 
                 # Fail detection via HP drop
@@ -700,7 +772,15 @@ def main():
                 if n - lr > 10:
                     pct = et/tms*100 if tms else 0
                     rem = (tms-et)/1000
-                    print(f"  [{pct:.0f}%] {et/1000:.0f}s/{tms/1000:.0f}s ({rem:.0f}s left)")
+                    correction_label = (
+                        f" | clock {clock_corrector.correction_ms:+.2f}ms"
+                        if clock_corrector is not None
+                        else ""
+                    )
+                    print(
+                        f"  [{pct:.0f}%] {et/1000:.0f}s/{tms/1000:.0f}s "
+                        f"({rem:.0f}s left){correction_label}"
+                    )
                     lr = n
 
         except Exception as e:
@@ -785,6 +865,13 @@ def main():
             print(f"  Score submitted if online!")
         else:
             print(f"  ABORTED. {cnt}/{tot} frames in {wt:.1f}s")
+        if input_limiter is not None:
+            print(
+                f"  WSLg input: sent {sent_input_frames} frame(s), "
+                f"dropped {dropped_movement_frames} redundant/stale movement frame(s)"
+            )
+        if clock_corrector is not None:
+            print(f"  WSLg clock correction: {clock_corrector.correction_ms:+.2f}ms")
         print(f"{'='*55}")
         tosu_running[0] = False
         break

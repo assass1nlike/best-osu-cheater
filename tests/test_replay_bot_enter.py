@@ -78,6 +78,16 @@ def test_frame_input_batches_mouse_before_key_changes(monkeypatch) -> None:
     assert key_up.u.ki.fl == replay_bot.KF_SCANCODE | replay_bot.KF_UP
 
 
+def test_wslg_pure_movement_allows_windows_to_coalesce(monkeypatch) -> None:
+    batches = []
+    monkeypatch.setattr(replay_bot, "_send_inputs", lambda inputs: batches.append(inputs))
+
+    replay_bot.send_frame_input(12345, 23456, [], no_coalesce=False)
+
+    assert len(batches) == 1
+    assert batches[0][0].u.mi.fl == replay_bot.MF_M | replay_bot.MF_A
+
+
 def test_cursor_preposition_holds_upcoming_press_position() -> None:
     frames = [
         SimpleNamespace(time_delta=0, x=0.0, y=0.0, keys=0),

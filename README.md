@@ -6,6 +6,23 @@ The Python package handles replay/beatmap processing offline. The standalone
 Windows playback scripts in this repository are the intended end-to-end path
 for feeding a synthesized replay into osu!lazer.
 
+The `vm-playback-research` branch also contains an experimental WSLg launcher.
+Run it from Windows PowerShell with `./launch_wsl_lazer.ps1`. It disables SDL
+relative mouse mode in lazer's persisted `input.json` before startup, then
+starts the Linux AppImage through X11 with Mesa's D3D12 backend. The launcher
+also disables SDL's XInput2 path and automatic mouse capture. WSLg exposes the
+Windows desktop to X11 through a scaled coordinate system; SDL's XInput2 and
+capture paths can otherwise feed stale or conflicting pointer coordinates back
+after the window loses and regains focus.
+
+The launcher defaults to the `Balanced` performance profile: a 1366x768 client,
+multi-threaded execution, and a restored WSLg window so a previously maximised
+4K surface is not reused. The user's lazer frame-limit setting is preserved. Use
+`./launch_wsl_lazer.ps1 -PerformanceProfile Quality` for a 1920x1080 client or
+`./launch_wsl_lazer.ps1 -PerformanceProfile Native` for the maximised native
+desktop surface. `Native` has substantially higher composition cost on a 4K
+Windows desktop.
+
 The current implementation can either take two local replays for the same
 beatmap or download two osu!lazer leaderboard replays, then create a new replay
 whose cursor path and key press intervals are dynamically blended. The package
@@ -315,6 +332,21 @@ and without a skippable opening intro:
 python replay_bot_enter.py synth_replay.osr --speed 1.5
 ```
 
+The same command works with the Linux AppImage launched by
+`launch_wsl_lazer.ps1`. Run both commands from Windows PowerShell in the
+repository root; do not run the playback bot inside Ubuntu. The bot detects the
+`osu! (Ubuntu-24.04)` WSLg window, reads its X11 content rectangle, and starts a
+short-lived read-only clock helper inside that distribution. No manual
+`--clock-reader` or WSL process ID is required.
+
+Batch playback is also automatic in WSLg:
+
+```powershell
+python auto_batch_play.py --manifest D:\osu-lazer\exports\batch_manifest.json
+```
+
+The WSLg window must remain visible and unobscured while input is playing.
+
 After ENTER is pressed, the bot continuously reads osu!lazer's `CurrentTime`.
 Because lazer also uses this global beatmap clock for song-select previews, the
 bot does not treat the first moving samples as gameplay. It waits for the
@@ -345,17 +377,20 @@ python replay_bot_enter.py synth_replay.osr --speed 1.0 --no-space
 The forced no-space path requires clock sync. With the default automatic mode,
 if clock sync is unavailable the bot falls back to the fixed-delay SPACE path.
 
-The reader is built from the source tree with .NET 8:
+For native Windows lazer, the reader is built from the source tree with .NET 8:
 
 ```powershell
 dotnet build tools/LazerClockReader/LazerClockReader.csproj -c Release
 ```
 
 The scripts use `tools/LazerClockReader/bin/Release/net8.0/LazerClockReader.exe`
-by default. In automatic mode, if the reader cannot attach, the bot falls back
-to the fixed-delay SPACE path. Forced `--no-space` requires the reader and exits
-when clock synchronization is unavailable. Use `--no-clock-sync` only when the
-legacy timer fallback is intentional.
+for native Windows lazer. WSLg uses `tools/wsl/lazer_clock_reader.py`
+automatically and translates the WSL monotonic clock to the Windows playback
+clock using minimum-round-trip calibration. In automatic mode, if the reader
+cannot attach, the bot falls back to the fixed-delay SPACE path. Forced
+`--no-space` requires the reader and exits when clock synchronization is
+unavailable. Use `--no-clock-sync` only when the legacy timer fallback is
+intentional.
 
 ### Config files
 
@@ -375,11 +410,13 @@ instead of long command lines:
 
 ### Common parameters
 
-The playback scripts require osu!lazer to be fullscreen on the primary screen.
-They reproduce osu!lazer's own `OsuPlayfieldAdjustmentContainer`: the gameplay
-playfield uses the source-defined 80% window adjustment, fits `512x384` at 4:3,
-and applies the source-defined 8-unit gameplay vertical shift. There is no
-manual playfield ratio parameter.
+Native Windows lazer playback requires fullscreen on the primary screen. WSLg
+playback supports the window created by `launch_wsl_lazer.ps1` and queries its
+actual X11 content rectangle on each bot start. Both paths reproduce lazer's
+`OsuPlayfieldAdjustmentContainer`: the gameplay playfield uses the
+source-defined 80% window adjustment, fits `512x384` at 4:3, and applies the
+source-defined 8-unit gameplay vertical shift. There is no manual playfield
+ratio parameter.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -388,7 +425,7 @@ manual playfield ratio parameter.
 | `--hr` | off | Vertically flip cursor input for Hard Rock gameplay |
 | `--clock-sync` | on | Read osu!lazer `CurrentTime` for automatic start and SPACE synchronization |
 | `--no-clock-sync` | off | Disable live clock reading and use the legacy timer |
-| `--clock-reader` | bundled | Override the reader executable or DLL path |
+| `--clock-reader` | bundled | Override the native Windows reader; WSLg selects its Linux reader automatically |
 | `--clock-sync-timeout-ms` | 5000 | Reader startup and SPACE acceptance timeout |
 | `--clock-jump-threshold-ms` | 100 | Minimum positive `CurrentTime` jump to accept |
 | `--space` | auto | Force fixed-delay SPACE mode |

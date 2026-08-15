@@ -27,22 +27,46 @@ class FullscreenPlayfield:
 
     @classmethod
     def from_screen(cls, screen_width: int, screen_height: int) -> FullscreenPlayfield:
+        return cls.from_viewport(
+            screen_width,
+            screen_height,
+            left=0,
+            top=0,
+            width=screen_width,
+            height=screen_height,
+        )
+
+    @classmethod
+    def from_viewport(
+        cls,
+        screen_width: int,
+        screen_height: int,
+        *,
+        left: int,
+        top: int,
+        width: int,
+        height: int,
+    ) -> FullscreenPlayfield:
         if screen_width <= 0 or screen_height <= 0:
             raise ValueError("screen dimensions must be positive")
-        adjusted_width = screen_width * OSU_PLAYFIELD_SIZE_ADJUST
-        adjusted_height = screen_height * OSU_PLAYFIELD_SIZE_ADJUST
+        if width <= 0 or height <= 0:
+            raise ValueError("viewport dimensions must be positive")
+        viewport_width = width
+        viewport_height = height
+        adjusted_width = viewport_width * OSU_PLAYFIELD_SIZE_ADJUST
+        adjusted_height = viewport_height * OSU_PLAYFIELD_SIZE_ADJUST
         scale = min(
             adjusted_width / OSU_PLAYFIELD_WIDTH,
             adjusted_height / OSU_PLAYFIELD_HEIGHT,
         )
-        width = OSU_PLAYFIELD_WIDTH * scale
-        height = OSU_PLAYFIELD_HEIGHT * scale
+        playfield_width = OSU_PLAYFIELD_WIDTH * scale
+        playfield_height = OSU_PLAYFIELD_HEIGHT * scale
         return cls(
             screen_width=screen_width,
             screen_height=screen_height,
             scale=scale,
-            left=(screen_width - width) / 2.0,
-            top=(screen_height - height) / 2.0 + OSU_GAMEPLAY_Y_SHIFT * scale,
+            left=left + (viewport_width - playfield_width) / 2.0,
+            top=top + (viewport_height - playfield_height) / 2.0 + OSU_GAMEPLAY_Y_SHIFT * scale,
         )
 
     @property

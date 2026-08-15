@@ -17,6 +17,7 @@ from lazer_clock_sync import (
     window_process_id,
 )
 from synthesis_osu_play.playfield import FullscreenPlayfield
+from wsl_lazer import distro_from_window_title, query_viewport
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -156,7 +157,7 @@ def main():
     parser.add_argument('--no-clock-sync', dest='clock_sync', action='store_false',
                         help='Use the legacy local timer after SPACE')
     parser.add_argument('--clock-reader', default=None,
-                        help='Path to LazerClockReader.exe or its .dll')
+                        help='Path to the native Windows clock reader (WSLg selects its reader automatically)')
     parser.add_argument('--clock-sync-timeout-ms', type=int, default=5000,
                         help='Timeout for reader startup and SPACE acceptance (default: 5000)')
     parser.add_argument('--clock-jump-threshold-ms', type=float, default=100.0,
@@ -206,7 +207,10 @@ def main():
     global osu_hwnd; osu_hwnd = hwnd
     if not hwnd: print("ERROR: osu!lazer not running!"); return
     osu_pid = window_process_id(hwnd)
+    wsl_distro = distro_from_window_title(title)
     print(f"\n  osu!lazer: \"{title}\"")
+    if wsl_distro:
+        print(f"  WSLg: {wsl_distro}")
     s=ctypes.windll.user32.GetWindowLongW(hwnd,-16)
     if s&0x20000000:
         ctypes.windll.user32.ShowWindow(hwnd,9); ctypes.windll.user32.ShowWindow(hwnd,5)
@@ -239,12 +243,32 @@ def main():
     print(f"  {tms/1000:.1f}s replay ({skipped/1000:.1f}s pause skipped) | {len(frames)} frames")
 
     sw,sh=scr()
-    playfield = FullscreenPlayfield.from_screen(sw, sh)
     window_width = rect.right - rect.left
     window_height = rect.bottom - rect.top
-    if (rect.left, rect.top, window_width, window_height) != (0, 0, sw, sh):
+    if wsl_distro:
+        try:
+            viewport = query_viewport(wsl_distro)
+        except RuntimeError as exc:
+            print(f"  ERROR: {exc}")
+            return
+        playfield = FullscreenPlayfield.from_viewport(
+            sw,
+            sh,
+            left=viewport.left,
+            top=viewport.top,
+            width=viewport.width,
+            height=viewport.height,
+        )
+        viewport_label = (
+            f"{viewport.width}x{viewport.height} at "
+            f"({viewport.left}, {viewport.top})"
+        )
+    else:
+        playfield = FullscreenPlayfield.from_screen(sw, sh)
+        viewport_label = f"{sw}x{sh} at (0, 0)"
+    if not wsl_distro and (rect.left, rect.top, window_width, window_height) != (0, 0, sw, sh):
         print("  WARNING: osu!lazer is not covering the primary screen; fullscreen is required")
-    print(f"  Screen: {sw}x{sh} | Playfield: {playfield.width:.1f}x{playfield.height:.1f} "
+    print(f"  Viewport: {viewport_label} | Playfield: {playfield.width:.1f}x{playfield.height:.1f} "
           f"at ({playfield.left:.1f}, {playfield.top:.1f}) | Scale: {playfield.scale:.4f}")
 
     def map_osu(osu_x, osu_y):
@@ -320,6 +344,7 @@ def main():
                     reader_path=args.clock_reader,
                     ready_timeout_ms=args.clock_sync_timeout_ms,
                     jump_threshold_ms=args.clock_jump_threshold_ms,
+                    wsl_distro=wsl_distro,
                 )
                 print("  Clock reader: ready")
             except ClockSyncError as exc:
