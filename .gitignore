@@ -7,6 +7,16 @@ __pycache__/
 htmlcov/
 .venv/
 .env
+.env.*
+!.env.example
+game.ini
+storage.ini
+*.osr
+*.osu
+*.osz
+*.log
+batch_manifest.json
+/prompts.md
 dist/
 build/
 *.egg-info/

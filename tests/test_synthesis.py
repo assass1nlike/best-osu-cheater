@@ -776,7 +776,9 @@ def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyP
         )
     )
 
-    result = synthesize_replays(first, second, beatmap=beatmap, synthesis_seed=0)
+    result = synthesize_replays(
+        first, second, beatmap=beatmap, synthesis_seed=0, spinner_mode="never"
+    )
     absolute = to_absolute_frames(result.replay.frames)
 
     first_weight, second_weight = effective_weights(
@@ -796,7 +798,7 @@ def test_spinner_synthesis_holds_key_through_spinner(monkeypatch: pytest.MonkeyP
     assert extract_key_intervals(absolute, LEGACY_X_KEY) == []
 
 
-def test_synthesis_uses_bundled_spinner_library_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesis_uses_local_spinner_library_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_replace_spinner_segments(*args, **kwargs):
@@ -1200,6 +1202,15 @@ def test_spinner_requires_rotation_and_key_hold() -> None:
     assert miss_metadata.rank == "D"
 
 
+@pytest.mark.skipif(
+    not all(path.is_file() for path in (
+        ARTIFACT_1643386 / "1643386.osu",
+        ARTIFACT_1643386 / "rank12_3410678288.osr",
+        ARTIFACT_1643386 / "rank14_5054510460.osr",
+        spinner_module.DEFAULT_SPINNER_LIBRARY_PATH,
+    )),
+    reason="requires local beatmap, replay, and spinner library artifacts",
+)
 def test_real_spinner_replay_is_scored_from_actual_input_state() -> None:
     beatmap = Beatmap.read_path(ARTIFACT_1643386 / "1643386.osu")
     source_12 = OsrReplay.read_path(ARTIFACT_1643386 / "rank12_3410678288.osr")

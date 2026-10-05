@@ -25,6 +25,9 @@ from .synthesis import SynthesisReport, synthesize_replays
 from .visualize import write_replay_debug_video
 
 
+# Public osu!lazer OAuth client configuration, not user credentials:
+# https://github.com/ppy/osu/blob/master/osu.Game/Online/ProductionEndpointConfiguration.cs
+# https://github.com/ppy/osu/blob/master/osu.Game/Online/DevelopmentEndpointConfiguration.cs
 PRODUCTION_API_URL = "https://osu.ppy.sh"
 PRODUCTION_CLIENT_ID = "5"
 PRODUCTION_CLIENT_SECRET = "FGc9GAtyHzeQDshWP5Ah7dega8hJACAJpQtw6OXk"
@@ -33,7 +36,7 @@ DEVELOPMENT_CLIENT_SECRET = "3LP2mhUrV89xxzD1YKNndXHEhWWCRLPNKioZ9ymT"
 MAX_SCORE_REQUEST_LIMIT = 100
 DEFAULT_SCORE_REQUEST_LIMIT = 50
 MAX_RANDOM_SEARCH_PAGE = 200
-DEFAULT_BATCH_OUTPUT_DIR = Path(r"D:\osu-lazer\exports")
+DEFAULT_BATCH_OUTPUT_DIR = Path("outputs")
 DEFAULT_BATCH_WORK_DIR = Path("artifacts") / "batch-dt"
 API_REQUEST_TIMEOUT_S = 30
 BATCH_SUPPORTED_SOURCE_MODS = frozenset(

@@ -3,6 +3,7 @@ import io
 import ssl
 import urllib.error
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -498,7 +499,19 @@ def test_random_batch_starts_at_random_page_and_stops_after_target(tmp_path: Pat
     assert client.search_requests[0][1] == client.search_requests[1][1]
 
 
-def test_batch_synthesis_filters_recent_pages_before_leaderboard_requests(tmp_path: Path) -> None:
+@pytest.mark.parametrize("eligible_age_days", [20, 21])
+def test_batch_synthesis_filters_recent_pages_before_leaderboard_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, eligible_age_days: int
+) -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr("synthesis_osu_play.online.datetime", FixedDatetime)
+
     class PaginatedBatchClient(FakeBatchClient):
         def __init__(self) -> None:
             super().__init__()
@@ -514,7 +527,8 @@ def test_batch_synthesis_filters_recent_pages_before_leaderboard_requests(tmp_pa
                         {
                             "id": 20002,
                             "title": "recent map",
-                            "ranked_date": "2026-08-01T00:00:00Z",
+                            # One second short of the minimum age.
+                            "ranked_date": "2026-08-01T00:00:01Z",
                             "beatmaps": [
                                 {
                                     "id": 10002,
@@ -527,7 +541,11 @@ def test_batch_synthesis_filters_recent_pages_before_leaderboard_requests(tmp_pa
                     ],
                     "cursor_string": "page-2",
                 }
-            return super().search_beatmapsets(**kwargs)
+            payload = super().search_beatmapsets(**kwargs)
+            payload["beatmapsets"][0]["ranked_date"] = (
+                now - timedelta(days=eligible_age_days)
+            ).isoformat()
+            return payload
 
         def get_scores(self, beatmap_id: int, **kwargs: object) -> dict[str, object]:
             self.score_requests.append(beatmap_id)
