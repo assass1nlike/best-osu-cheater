@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spinner-library",
         type=Path,
         default=None,
-        help="spinner trajectory library JSON; defaults to the bundled library",
+        help="spinner trajectory library JSON; defaults to the local artifacts/spinner-trajectories library",
     )
     synthesize.add_argument(
         "--spinner-mode",
@@ -252,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spinner-library",
         type=Path,
         default=None,
-        help="spinner trajectory library JSON; defaults to the bundled library",
+        help="spinner trajectory library JSON; defaults to the local artifacts/spinner-trajectories library",
     )
     download_synthesize.add_argument(
         "--spinner-mode",
@@ -329,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spinner-library",
         type=Path,
         default=None,
-        help="spinner trajectory library JSON; defaults to the bundled library",
+        help="spinner trajectory library JSON; defaults to the local artifacts/spinner-trajectories library",
     )
     batch_dt.add_argument(
         "--spinner-mode",

@@ -2,7 +2,7 @@
 
 Usage:
   python auto_batch_play.py [--manifest batch_manifest.json]
-                            [--output-dir D:\\osu-lazer\\exports]
+                            [--output-dir outputs]
                             [--leadin-time 6000] [--advance 0]
                             [--tune-n 30] [--tune-threshold 10]
                             [--tune-n2 150] [--tune-threshold2 5]
@@ -17,6 +17,8 @@ Usage:
 import ctypes, time, sys, argparse, subprocess, json, random, urllib.request
 from ctypes import wintypes, byref, sizeof, Structure, Union
 from pathlib import Path
+
+from synthesis_osu_play.online import DEFAULT_BATCH_OUTPUT_DIR
 
 # ---------------------------------------------------------------------------
 # Windows input (same as replay_bot)
@@ -129,10 +131,9 @@ def press_esc():
 def main():
     parser = argparse.ArgumentParser(description="Batch auto-play synthesized replays")
     parser.add_argument("--manifest", type=Path,
-                        default=r"D:\osu-lazer\exports\batch_manifest.json",
-                        help="batch manifest JSON")
+                        help="batch manifest JSON; defaults to <output-dir>/batch_manifest.json")
     parser.add_argument("--output-dir", type=Path,
-                        default=r"D:\osu-lazer\exports",
+                        default=DEFAULT_BATCH_OUTPUT_DIR,
                         help="directory with [beatmap_id].osr files")
     # Replay bot params
     parser.add_argument("--leadin-time", type=int, default=6000)
@@ -175,6 +176,8 @@ def main():
     parser.add_argument("--start-bot-after-enter", action="store_true",
                         help="legacy mode: press ENTER before launching the replay bot")
     args = parser.parse_args()
+    if args.manifest is None:
+        args.manifest = args.output_dir / "batch_manifest.json"
 
     if args.startup_wait_s < 0:
         parser.error("--startup-wait-s must be non-negative")

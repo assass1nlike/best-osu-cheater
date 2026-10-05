@@ -1,4 +1,7 @@
-# synthesis-osu-play
+# best-osu-cheater
+
+**The code in this repository is intended to support the development of anti-cheat measures for osu!.**
+Please use it offline only. Online use is **prohibited**, and it must not be used to gain pp through unfair means.
 
 Tools for synthesizing osu! replay input streams for osu!lazer playback.
 
@@ -98,21 +101,23 @@ and two leaderboard replays before synthesizing:
 
 ```powershell
 python -m synthesis_osu_play download-synthesize 4460247 1 25 output.osr `
-  --player-name assassinlike `
+  --player-name synthesis `
   --first-weight 0.3 `
   --second-weight 0.7
 ```
 
 `download-synthesize` accepts the same `--debug-video` options, so the one-shot
 path can download the sources, synthesize, and render the diagnostic overlay in
-one run. The bundled spinner trajectory library is used automatically; pass
-`--spinner-mode never` to disable spinner trajectory replacement.
+one run. Spinner replacement reads the local trajectory library at
+`artifacts/spinner-trajectories/spinner_trajectory_library.json` by default.
+The library is not included in Git; provide one with `--spinner-library`, or
+pass `--spinner-mode never` to disable spinner trajectory replacement.
 
 To randomly select from all ranked osu!standard difficulties and synthesize a
 batch of DT replays:
 
 ```powershell
-python -m synthesis_osu_play batch-dt 10 --player-name assassinlike
+python -m synthesis_osu_play batch-dt 10 --player-name synthesis
 ```
 
 By default this chooses a random starting page from the ranked search API's
@@ -122,12 +127,12 @@ returns 50 beatmapsets, from which osu!standard difficulties in the 4.5-5.0
 star range are kept. The search wraps from page 200 to page 1 if necessary.
 `--random-search-pages` can cap the number of consecutive pages; its default is
 200. Outputs are named by beatmap ID and written to
-`D:\osu-lazer\exports`. Short-intro beatmaps are included by default. To use the
-age-filtered newest-first mode instead, pass
+`outputs/` relative to the working directory. Short-intro beatmaps are included
+by default. To use the age-filtered newest-first mode instead, pass
 `--beatmap-selection recent --min-age-days 7`. The skip-ready filter remains
 optional; pass `--min-skip-time 4000` to enable it.
 
-The bundled spinner trajectory library is also used automatically for every
+The local spinner trajectory library is also used automatically for every
 generated DT replay. Pass `--spinner-mode never` to disable spinner trajectory
 replacement.
 
@@ -147,7 +152,7 @@ Adjust count, age, star range, and output location like this:
 
 ```powershell
 python -m synthesis_osu_play batch-dt 5 `
-  --output-dir D:\osu-lazer\exports `
+  --output-dir outputs/custom-batch `
   --beatmap-selection recent `
   --min-age-days 7 `
   --min-star 4.8 `
@@ -157,8 +162,9 @@ python -m synthesis_osu_play batch-dt 5 `
 
 This reads osu!lazer's saved API token from `game.ini`, following
 `%APPDATA%\osu\storage.ini` when lazer uses a custom storage path. Use
-`--lazer-storage D:\osu-lazer` or `--token-config D:\osu-lazer\game.ini` if
-auto-discovery is not correct. Expired access tokens are refreshed through the
+`--lazer-storage "<lazer-storage-dir>"` or
+`--token-config "<lazer-storage-dir>/game.ini"` if auto-discovery is not correct.
+Expired access tokens are refreshed through the
 same OAuth refresh-token flow that osu!lazer uses, then written back to
 `game.ini`.
 
@@ -276,6 +282,10 @@ Without `--beatmap`, the command cannot judge objects and keeps the first
 replay's score metadata.
 
 ## Automated Replay Playback
+
+`auto_batch_play.py` reads `outputs/batch_manifest.json` by default. Use
+`--output-dir` to select another output directory; the default manifest follows
+that directory. Use `--manifest` to select a specific manifest file.
 
 Two standalone scripts inject synthesized (or any) `.osr` replay frames as live
 Windows input into osu!lazer, triggering genuine score submission.
